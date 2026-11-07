@@ -215,5 +215,16 @@ class BrowserAndLeaseTests(unittest.TestCase):
                 self.assertFalse(gateway.lease_valid())
 
 
+class CLITests(unittest.TestCase):
+    def test_tool_flags_reach_the_tool_in_original_order(self):
+        from ewb_windows.__main__ import main
+        for tail in (["claude", "--continue"], ["claude", "-p", "hello", "--model", "sonnet"], ["codex", "--help"], ["codex", "exec", "hello"]):
+            engine = Mock()
+            engine.tool_command.return_value = ["not-executed"]
+            with self.subTest(tail=tail), patch("sys.argv", ["ewb", *tail]), patch("ewb_windows.__main__.Store"), patch("ewb_windows.__main__.Engine", return_value=engine), patch("ewb_windows.__main__.subprocess.call", return_value=0):
+                self.assertEqual(main(), 0)
+                self.assertEqual(engine.tool_command.call_args.args[1], list(tail))
+
+
 if __name__ == "__main__":
     unittest.main()

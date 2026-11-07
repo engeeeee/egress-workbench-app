@@ -44,6 +44,13 @@ jobs:
         run: |
           & ./windows/dist/ewb/ewb.exe --version
           if ($LASTEXITCODE -ne 0) { throw 'Packaged CLI check failed.' }
+          $smokeHome = Join-Path $env:RUNNER_TEMP 'ewb-packaged-smoke'
+          & ./windows/dist/ewb/ewb.exe --data $smokeHome relay
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged relay import check failed.' }
+          $gui = Start-Process -FilePath ./windows/dist/EgressWorkbench/EgressWorkbench.exe -ArgumentList '--data', $smokeHome -PassThru
+          Start-Sleep -Seconds 5
+          if ($gui.HasExited) { throw 'Packaged GUI exited during startup.' }
+          Stop-Process -Id $gui.Id
       - uses: actions/upload-artifact@v4
         with:
           name: Egress-Workbench-Windows-x64

@@ -16,7 +16,7 @@ def main():
     parser.add_argument("--data", type=Path, help="专用数据目录，默认位于 LocalAppData")
     parser.add_argument("--project", default=str(Path.cwd()), help="项目目录")
     sub = parser.add_subparsers(dest="action")
-    for action in ("gui", "doctor", "install", "check", "confirm", "browser", "stop", "status", "guard", "shell"):
+    for action in ("gui", "doctor", "install", "check", "confirm", "browser", "stop", "status", "guard", "relay", "shell"):
         sub.add_parser(action)
     importer = sub.add_parser("import-node")
     importer.add_argument("file", type=Path, help="本地订阅/节点文件（不保存订阅地址）")
@@ -35,7 +35,11 @@ def main():
             launch(store)
             return 0
         engine = Engine(store, lambda text: print(text, file=sys.stderr, flush=True))
-        if args.action == "import-node":
+        if args.action == "relay":
+            from .relay import main as relay_main
+            relay_main(store)
+            return 0
+        elif args.action == "import-node":
             nodes, warnings = parse_nodes(args.file.read_text(encoding="utf-8-sig"))
             engine.save_nodes(nodes)
             result = {"nodes": [{"index": i + 1, "name": n["label"]} for i, n in enumerate(nodes)], "warnings": warnings}

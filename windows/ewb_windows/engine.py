@@ -11,7 +11,9 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import urllib.request
 import webbrowser
+import zipfile
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .state import Store, WorkbenchError, fingerprint
@@ -75,8 +77,11 @@ class Engine:
         self.docker = Docker(self.settings["context"])
         self.prefix = "ewbw-" + store.instance
         self.internal, self.external = self.prefix + "-internal", self.prefix + "-external"
-        self.recipe = fingerprint({str(p.relative_to(RESOURCES)): p.read_text(encoding="utf-8") for p in sorted(RESOURCES.rglob("*")) if p.is_file() and "__pycache__" not in str(p)})[:12]
-        self.images = {role: "ewb-windows/" + role + ":" + self.recipe for role in ("gateway", "work", "browser")}
+        files = {p.relative_to(RESOURCES).as_posix(): p.read_text(encoding="utf-8") for p in sorted(RESOURCES.rglob("*")) if p.is_file() and "__pycache__" not in str(p)}
+        self.recipe = fingerprint(files)[:12]
+        self.recipes = {role: fingerprint({name: files[name] for name in names})[:12] for role, names in {"gateway": ["Dockerfile.gateway", "gateway.py"], "work": ["Dockerfile.work", "probe.py", "open_browser.py"]}.items()}
+        self.recipes["browser"] = fingerprint({"work": self.recipes["work"], **{name: files[name] for name in ("Dockerfile.browser", "browser.py", "vnc_stdio.py", "chromium-policy.json")}})[:12]
+        self.images = {role: "ewb-windows/" + role + ":" + self.recipes[role] for role in ("gateway", "work", "browser")}
 
     def owned(self, obj, role: str | None = None):
         labels = obj.get("Config", {}).get("Labels", obj.get("Labels")) or {}
@@ -110,11 +115,11 @@ class Engine:
             build_log = self.store.home / "build.log"
             for role in ("gateway", "work", "browser"):
                 item = self.docker.inspect("image", self.images[role])
-                if item and (item.get("Config", {}).get("Labels") or {}).get(RECIPE) == self.recipe:
+                if item and (item.get("Config", {}).get("Labels") or {}).get(RECIPE) == self.recipes[role]:
                     self.log(role + " 镜像已就绪。")
                     continue
                 self.log("构建 " + role + " 镜像；首次安装需要下载工具和 Chromium…")
-                self.docker.run("build", "--network", self.external, "--label", RECIPE + "=" + self.recipe, "--build-arg", "WORK_IMAGE=" + self.images["work"], "-f", str(RESOURCES / ("Dockerfile." + role)), "-t", self.images[role], str(RESOURCES), timeout=2400, log=build_log)
+                self.docker.run("build", "--network", self.external, "--label", RECIPE + "=" + self.recipes[role], "--build-arg", "WORK_IMAGE=" + self.images["work"], "-f", str(RESOURCES / ("Dockerfile." + role)), "-t", self.images[role], str(RESOURCES), timeout=2400, log=build_log)
             self.store.write("images.json", {role: self.docker.inspect("image", name)["Id"] for role, name in self.images.items()})
             self.log("环境安装完成。请导入节点，再检查和确认连接。")
 
@@ -219,7 +224,7 @@ class Engine:
         gateway = self.ensure_container("gateway", ids["gateway"], ["--network", self.internal, "--ip", gateway_ip, "--read-only", "--tmpfs", "/tmp", "--mount", f"type=bind,source={directory},target=/config,readonly"], ["run", "-c", "/config/config.json"])
         if self.external not in gateway["NetworkSettings"]["Networks"]:
             self.docker.run("network", "connect", "--gw-priority", "1", self.external, gateway["Id"])
-        session = self.ensure_container("session", ids["work"], ["--network", self.internal, "--ip", session_ip, "--dns", "127.0.0.1", "--publish", "127.0.0.1::6080", "--read-only", "--tmpfs", "/tmp", "--memory", "128m"], ["sleep", "infinity"])
+        session = self.ensure_container("session", ids["work"], ["--network", self.internal, "--ip", session_ip, "--dns", "127.0.0.1", "--read-only", "--tmpfs", "/tmp", "--memory", "128m"], ["sleep", "infinity"])
         self.store.write("environment.json", {"timezone": self.store.settings()["timezone"]})
         return {"gateway": gateway["Id"], "session": session["Id"], "proxy": f"http://{gateway_ip}:2080", "config_hash": fingerprint(config)}
 
@@ -286,11 +291,14 @@ class Engine:
                 self._stop("连接尚未确认，环境已停止。")
                 raise
 
-    def start_guard(self):
+    def background(self, action):
         args = ([sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "ewb_windows"])
         flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS if os.name == "nt" else 0
-        with (self.store.home / "guard.log").open("a", encoding="utf-8") as log:
-            subprocess.Popen([*args, "--data", str(self.store.home), "guard"], stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=os.environ.copy(), cwd=str(Path(__file__).resolve().parent.parent), creationflags=flags, start_new_session=os.name != "nt")
+        with (self.store.home / (action + ".log")).open("a", encoding="utf-8") as log:
+            subprocess.Popen([*args, "--data", str(self.store.home), action], stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=os.environ.copy(), cwd=str(Path(__file__).resolve().parent.parent), creationflags=flags, start_new_session=os.name != "nt")
+
+    def start_guard(self):
+        self.background("guard")
 
     def ready(self):
         state = self.store.read("runtime.json", {})
@@ -366,11 +374,64 @@ class Engine:
         if old and not old["State"]["Running"]:
             self.docker.run("rm", old["Id"])
         obj = self.ensure_container("browser", ids["browser"], ["--network", "container:" + state["session"], "--shm-size", "512m", "--memory", "2g", "--volume", self.prefix + "-browser-home:/home/workspace", "--volume", self.prefix + "-downloads:/home/workspace/Downloads", *self.proxy_env(state)])
-        ports = self.inspect("session")["NetworkSettings"]["Ports"]["6080/tcp"]
-        if not ports or ports[0]["HostIp"] != "127.0.0.1":
-            raise WorkbenchError("浏览器显示端口未限定为本机。")
+        for _ in range(40):
+            try:
+                self.docker.run("exec", obj["Id"], "python3", "-c", "import socket; socket.create_connection(('127.0.0.1',5900),.3).close(); socket.create_connection(('127.0.0.1',6081),.3).close()", timeout=3)
+                break
+            except WorkbenchError:
+                if not self.inspect("browser")["State"]["Running"]:
+                    raise WorkbenchError("共享浏览器启动失败，请检查此实例 browser 容器的日志。")
+                time.sleep(.5)
+        else:
+            raise WorkbenchError("共享浏览器启动超时，请重试。")
+        self.viewer_assets(obj)
+        descriptor = self.display_relay(obj, state)
         token = urllib.parse.quote("websockify?token=" + state["browser_token"], safe="")
-        return f"http://127.0.0.1:{ports[0]['HostPort']}/vnc.html?autoconnect=true&resize=scale&path={token}"
+        return descriptor["origin"] + f"/vnc.html?autoconnect=true&resize=scale&path={token}"
+
+    def viewer_assets(self, browser):
+        if self.store.read("viewer-assets.json", {}).get("image") == browser["Image"] and (self.store.home / "viewer-assets/vnc.html").is_file():
+            return
+        self.log("准备本机浏览器显示组件…")
+        archive = self.store.home / "viewer-assets.zip"
+        script = "import os,sys,zipfile; from pathlib import Path; root=Path('/usr/share/novnc'); z=zipfile.ZipFile(sys.stdout.buffer,'w',zipfile.ZIP_DEFLATED); n=0\nfor directory,dirs,files in os.walk(root,followlinks=True):\n for name in files:\n  p=Path(directory)/name; n+=1\n  if n>2000: raise ValueError('Too many files')\n  z.writestr(p.relative_to(root).as_posix(),p.read_bytes())\nz.close()"
+        with archive.open("wb") as stream:
+            result = subprocess.run(self.docker.command("exec", browser["Id"], "python3", "-c", script), stdout=stream, stderr=subprocess.PIPE, env=self.docker.environment(), timeout=60, creationflags=HIDDEN)
+        if result.returncode or archive.stat().st_size > 20 * 1024 * 1024:
+            raise WorkbenchError("无法提取浏览器显示组件。")
+        root = (self.store.home / "viewer-assets").resolve()
+        root.mkdir(exist_ok=True)
+        with zipfile.ZipFile(archive) as bundle:
+            if sum(i.file_size for i in bundle.infolist()) > 40 * 1024 * 1024:
+                raise WorkbenchError("浏览器显示组件大小异常。")
+            for item in bundle.infolist():
+                target = (root / item.filename).resolve()
+                if root not in target.parents or "\\" in item.filename or ":" in item.filename:
+                    raise WorkbenchError("浏览器显示组件路径异常。")
+                if not item.is_dir():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(bundle.read(item))
+        archive.unlink(missing_ok=True)
+        self.store.write("viewer-assets.json", {"image": browser["Image"]})
+
+    def display_relay(self, browser, state):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for attempt in range(40):
+            descriptor = self.store.read("relay.json", {})
+            origin = descriptor.get("origin", "")
+            parsed = urllib.parse.urlsplit(origin)
+            if parsed.scheme == "http" and parsed.hostname == "127.0.0.1" and descriptor.get("browser") == browser["Id"] and descriptor.get("token") == state["browser_token"]:
+                try:
+                    request = urllib.request.Request(origin + "/control/status", headers={"X-EWB-Control": descriptor["control"]})
+                    with opener.open(request, timeout=1) as response:
+                        if json.load(response).get("browser") == browser["Id"]:
+                            return descriptor
+                except (OSError, ValueError, KeyError):
+                    pass
+            if attempt % 4 == 0:
+                self.background("relay")
+            time.sleep(.5)
+        raise WorkbenchError("本机显示服务未能启动，请查看数据目录中的 relay.log。")
 
     def browser(self):
         with self.store.lock():

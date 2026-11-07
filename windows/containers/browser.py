@@ -49,10 +49,6 @@ def main():
         time.sleep(0.1)
     spawn(["openbox"])
     browser = spawn([*chromium, "about:blank"])
-    token_file = Path("/tmp/ewb-vnc-tokens")
-    token_file.write_text(token + ": 127.0.0.1:5900\n")
-    token_file.chmod(0o600)
-    relay = spawn(["websockify", "--web=/usr/share/novnc", "--token-plugin=TokenFile", "--token-source=" + str(token_file), "0.0.0.0:6080"])
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -83,7 +79,7 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         while not stopped.wait(1):
-            if any(p.poll() is not None for p in (vnc, browser, relay)):
+            if any(p.poll() is not None for p in (vnc, browser)):
                 break
     finally:
         server.shutdown()

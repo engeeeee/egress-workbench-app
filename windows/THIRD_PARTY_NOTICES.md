@@ -7,6 +7,7 @@ The repository's LICENSE and AUTHORS.md are preserved. The following independent
 - Python / Tcl / Tk: https://www.python.org/psf/license/ and https://www.tcl.tk/software/tcltk/license.html
 - PyYAML (MIT): https://github.com/yaml/pyyaml/blob/main/LICENSE
 - tzdata (Apache-2.0, IANA time-zone data public-domain notices): https://github.com/python/tzdata
+- websockets (BSD-3-Clause): https://github.com/python-websockets/websockets
 - PyInstaller bootloader (GPL with distribution exception): https://pyinstaller.org/en/stable/license.html
 - sing-box (GPL-3.0 and its project notices): https://github.com/SagerNet/sing-box
 - Node.js and npm: https://github.com/nodejs/node/blob/main/LICENSE and https://github.com/npm/cli/blob/latest/LICENSE
