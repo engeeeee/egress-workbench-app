@@ -35,7 +35,8 @@ def main():
         while data := process.stdout.read(1024 * 1024):
             stream.write(data)
     assert process.wait() == 0
-    digest = hashlib.file_digest(archive.open("rb"), "sha256").hexdigest()
+    with archive.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
     manifest = {"schema": 1, "version": __version__, "platform": "linux/amd64", "filename": filename, "bytes": archive.stat().st_size, "sha256": digest, "recipes": report["recipes"], "images": report["images"]}
     (args.output / filename.replace(".tar.gz", ".json")).write_text(json.dumps(manifest, indent=2) + "\n")
     (args.output / (filename + ".sha256")).write_text(digest + "  " + filename + "\n")

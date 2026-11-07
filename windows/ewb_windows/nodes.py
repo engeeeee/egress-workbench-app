@@ -85,6 +85,8 @@ def normalize(value: dict, label: str = "") -> dict:
     if any(tls.get(k) for k in ("reality", "utls", "ech", "certificate", "certificate_path", "certificate_public_key_sha256")):
         raise ValueError("此预览版暂不支持 Reality、uTLS、ECH 或自定义证书配置")
     enabled = truth(tls.get("enabled", kind in ("trojan", "vless")))
+    if enabled and kind in ("socks", "shadowsocks"):
+        raise ValueError("此协议暂不支持额外的 TLS 包装")
     if kind in ("trojan", "vless") and not enabled:
         raise ValueError("Trojan / VLESS 节点必须启用 TLS")
     if enabled:
@@ -152,7 +154,7 @@ def uri_node(uri: str) -> dict:
 def clash_node(v: dict) -> dict:
     if v.get("network", "tcp") != "tcp" or v.get("plugin") or v.get("reality-opts") or v.get("flow") or v.get("client-fingerprint"):
         raise ValueError("Clash 节点使用了暂不支持的传输选项")
-    return normalize({"type": v.get("type"), "server": v.get("server"), "server_port": v.get("port"), "password": v.get("password"), "uuid": v.get("uuid"), "method": v.get("cipher"), "alter_id": v.get("alterId", 0), "security": v.get("cipher", "auto"), "tls": {"enabled": v.get("tls", v.get("type") in ("trojan", "vless")), "server_name": v.get("servername") or v.get("sni"), "insecure": truth(v.get("skip-cert-verify", False))}}, v.get("name", ""))
+    return normalize({"type": v.get("type"), "server": v.get("server"), "server_port": v.get("port"), "username": v.get("username", ""), "password": v.get("password", ""), "uuid": v.get("uuid"), "method": v.get("cipher"), "alter_id": v.get("alterId", 0), "security": v.get("cipher", "auto"), "tls": {"enabled": v.get("tls", v.get("type") in ("trojan", "vless", "https")), "server_name": v.get("servername") or v.get("sni"), "insecure": truth(v.get("skip-cert-verify", False))}}, v.get("name", ""))
 
 
 def parse_nodes(text: str) -> tuple[list[dict], list[str]]:

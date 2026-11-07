@@ -3,7 +3,7 @@
 <p align="center">让 Claude Code、Codex 与浏览器在统一的工作环境中运行。</p>
 <p align="center"><a href="README.md">English</a> · <strong>简体中文</strong></p>
 
-> **Windows 预览实现：** 本分支新增 [Windows 版源码、启动及打包说明](windows/README.zh-CN.md)。它使用重新实现的主机控制层与原生架构 Linux 容器，和下方介绍的原版 macOS 安装包分别维护。
+> **Windows 0.2.0 预览版：** [下载安装版或免安装版](https://github.com/engeeeee/egress-workbench-app/releases/tag/v0.2.0-windows)，包含新中文界面、可续传环境包和“本机线路 → SOCKS5 / HTTP / HTTPS 落地”连接。[Windows 使用说明](windows/README.zh-CN.md)。Windows 独立实现与下方原版 macOS 安装包分别维护。
 
 Egress Workbench 是面向 macOS 的**指纹运行环境**，为 Claude Code、Codex 和共享 Chromium 提供统一的网络出口、时区配置与持久化工作空间。
 

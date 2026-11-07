@@ -100,6 +100,9 @@ class App:
         ttk.Label(footer, textvariable=self.operation, style="Muted.TLabel", wraplength=840).pack(anchor="w")
         self.refresh_nodes()
         self.show_page("overview")
+        root.bind("<MouseWheel>", self.scroll_page, add="+")
+        root.bind("<Button-4>", self.scroll_page, add="+")
+        root.bind("<Button-5>", self.scroll_page, add="+")
         self.poll()
         root.protocol("WM_DELETE_WINDOW", self.close)
         if auto_check:
@@ -249,6 +252,14 @@ class App:
         self.pages[name].pack(fill="both", expand=True)
         self.heading.set(self.nav[name].cget("text").strip())
         self.page_name = name
+
+    def scroll_page(self, event):
+        if isinstance(event.widget, (tk.Text, tk.Listbox, ttk.Combobox)):
+            return
+        canvas = self.pages[self.page_name].canvas
+        if canvas.yview() != (0.0, 1.0):
+            step = -1 if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0 else 1
+            canvas.yview_scroll(step * 3, "units")
 
     def add_log(self, value):
         self.log_view.configure(state="normal")

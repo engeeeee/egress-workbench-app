@@ -68,8 +68,14 @@ jobs:
           if ($setup.ExitCode -ne 0 -or -not (Test-Path "$appDir/EgressWorkbench.exe")) { throw 'Setup failed.' }
           & "$appDir/ewb.exe" --version
           if ($LASTEXITCODE -ne 0) { throw 'Installed CLI failed.' }
+          $startMenu = [Environment]::GetFolderPath('Programs')
+          if (-not (Test-Path (Join-Path $startMenu 'Egress Workbench.lnk'))) { throw 'Start-menu shortcut missing.' }
+          $privateData = Join-Path $env:LOCALAPPDATA 'EgressWorkbenchWindows'
+          New-Item -ItemType Directory -Path $privateData -Force | Out-Null
+          Set-Content (Join-Path $privateData 'uninstall-test.txt') 'preserved'
           $uninstall = Start-Process -FilePath "$appDir/unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait
           if ($uninstall.ExitCode -ne 0) { throw 'Uninstall failed.' }
+          if ((Get-Content (Join-Path $privateData 'uninstall-test.txt')) -ne 'preserved') { throw 'Uninstall removed private data.' }
       - uses: actions/upload-artifact@v4
         with:
           name: Egress-Workbench-Windows-x64-0.2.0
@@ -102,6 +108,11 @@ jobs:
         env:
           PYTHONPATH: windows
         run: python tools/export_runtime.py --context default --report "$RUNNER_TEMP/integration-results.json" --output "$RUNNER_TEMP/runtime-package"
+      - name: Install and repeat the exported archive
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/windows-ux'
+        env:
+          PYTHONPATH: windows
+        run: python -u tests/integration_prebuilt.py --context default --directory "$RUNNER_TEMP/runtime-package"
       - name: Stage verified runtime files
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/windows-ux'
         uses: actions/github-script@v7

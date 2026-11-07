@@ -50,6 +50,21 @@ class ProxyImportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             uri_node("https://example.com/subscription/token")
 
+    def test_clash_proxy_auth_and_tls_are_preserved(self):
+        nodes, errors = parse_nodes('''proxies:
+  - {name: Socks, type: socks5, server: proxy.example, port: 1080, username: user, password: secret}
+  - {name: Secure, type: http, server: proxy.example, port: 8443, username: user, password: secret, tls: true}
+  - {name: HTTPS, type: https, server: proxy.example, port: 443}
+''')
+        self.assertEqual(errors, [])
+        self.assertEqual([protocol(n) for n in nodes], ["SOCKS5", "HTTPS", "HTTPS"])
+        self.assertEqual(nodes[0]["outbound"]["username"], "user")
+        self.assertEqual(nodes[1]["outbound"]["password"], "secret")
+
+    def test_unsupported_socks_tls_is_rejected(self):
+        with self.assertRaises(WorkbenchError):
+            parse_nodes('proxies: [{type: socks5, server: proxy.example, port: 1080, tls: true}]')
+
 
 class DownloadTests(unittest.TestCase):
     def setUp(self):

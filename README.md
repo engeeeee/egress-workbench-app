@@ -3,7 +3,7 @@
 <p align="center">One working environment for Claude Code, Codex and Chromium.</p>
 <p align="center"><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
 
-> **Windows preview implementation:** this branch adds a rebuilt Windows host and native-architecture Linux container recipes. See [Windows setup and build instructions](windows/README.zh-CN.md). The original macOS release described below is maintained separately.
+> **Windows 0.2.0 preview:** download the [Windows installer or portable ZIP](https://github.com/engeeeee/egress-workbench-app/releases/tag/v0.2.0-windows). Includes a Chinese desktop UI, resumable runtime downloads, and local line proxy → SOCKS5 / HTTP / HTTPS landing chains. See [Windows setup instructions](windows/README.zh-CN.md). The original macOS release described below is maintained separately.
 
 Egress Workbench is a **fingerprint runtime environment** for macOS, providing Claude Code, Codex and shared Chromium with a common network exit, configured time zone and persistent workspaces.
 
