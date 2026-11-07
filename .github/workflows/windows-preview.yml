@@ -56,3 +56,16 @@ jobs:
           name: Egress-Workbench-Windows-x64
           path: windows/dist/Egress-Workbench-Windows-x64-0.1.0.zip
           if-no-files-found: error
+  containers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r windows/requirements.txt
+      - name: Native x64 Docker integration
+        env:
+          PYTHONPATH: windows
+        run: python -u tests/integration_runtime.py --context default --output "$RUNNER_TEMP/integration-results.json"

@@ -119,7 +119,7 @@ class Engine:
                     self.log(role + " 镜像已就绪。")
                     continue
                 self.log("构建 " + role + " 镜像；首次安装需要下载工具和 Chromium…")
-                self.docker.run("build", "--network", self.external, "--label", RECIPE + "=" + self.recipes[role], "--build-arg", "WORK_IMAGE=" + self.images["work"], "-f", str(RESOURCES / ("Dockerfile." + role)), "-t", self.images[role], str(RESOURCES), timeout=2400, log=build_log)
+                self.docker.run("build", "--network", "default", "--label", RECIPE + "=" + self.recipes[role], "--build-arg", "WORK_IMAGE=" + self.images["work"], "-f", str(RESOURCES / ("Dockerfile." + role)), "-t", self.images[role], str(RESOURCES), timeout=2400, log=build_log)
             self.store.write("images.json", {role: self.docker.inspect("image", name)["Id"] for role, name in self.images.items()})
             self.log("环境安装完成。请导入节点，再检查和确认连接。")
 
