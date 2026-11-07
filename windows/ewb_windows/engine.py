@@ -195,11 +195,13 @@ class Engine:
             self._stop("运行环境正在更新，请在完成后重新核对连接。")
             progress({"stage": "import"})
             self.docker.run("load", "--input", str(archive), timeout=1200, log=self.store.home / "build.log", on_line=self.log, cancel=cancel)
+            resolved = {}
             for role, identifier in meta["images"].items():
-                obj = self.docker.inspect("image", identifier)
-                if not obj or (obj.get("Config", {}).get("Labels") or {}).get(RECIPE) != self.recipes[role]:
+                obj = self.docker.inspect("image", identifier) or self.docker.inspect("image", meta["image_configs"][role])
+                if not obj or obj.get("Architecture") != "amd64" or (obj.get("Config", {}).get("Labels") or {}).get(RECIPE) != self.recipes[role]:
                     raise WorkbenchError("导入的镜像与本版本不匹配，请重试。")
-            self.store.write("images.json", {**meta["images"], **available})
+                resolved[role] = obj["Id"]
+            self.store.write("images.json", {**resolved, **available})
             self.store.write("runtime-bundle.json", {"version": meta["version"], "sha256": meta["sha256"], "bytes": meta["bytes"]})
             progress({"stage": "done"})
 

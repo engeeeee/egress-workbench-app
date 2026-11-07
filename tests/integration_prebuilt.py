@@ -21,6 +21,11 @@ def main():
     args = parser.parse_args()
     meta = json.loads((args.directory / f"Egress-Workbench-Runtime-linux-amd64-{__version__}.json").read_text())
     docker = Docker(args.context)
+    resolved = {}
+    for role, identifier in meta["images"].items():
+        image = docker.inspect("image", identifier) or docker.inspect("image", meta["image_configs"][role])
+        if image:
+            resolved[role] = image["Id"]
     name = "ewb-bundle-test-" + uuid.uuid4().hex[:12]
     tag = name + ":preserve"
     class QuietHandler(SimpleHTTPRequestHandler):
@@ -29,8 +34,12 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(QuietHandler, directory=str(args.directory)))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        docker.run("tag", meta["images"]["work"], tag)
-        docker.run("run", "--name", name, "--entrypoint", "sh", tag, "-c", "printf preserved > /tmp/ewb-preserved")
+        if len(resolved) != 3:
+            docker.run("load", "--input", str(args.directory / meta["filename"]), timeout=1200)
+            for role, identifier in meta["images"].items():
+                resolved[role] = (docker.inspect("image", identifier) or docker.inspect("image", meta["image_configs"][role]))["Id"]
+        docker.run("tag", resolved["work"], tag)
+        docker.run("run", "--name", name, "--network", "none", "--entrypoint", "sh", tag, "-c", "printf preserved > /tmp/ewb-preserved")
         existing = docker.inspect("container", name)["Id"]
         with tempfile.TemporaryDirectory() as private:
             store = Store(Path(private))
@@ -40,12 +49,12 @@ def main():
             stages = []
             with patch.object(downloads, "RELEASE", f"http://127.0.0.1:{server.server_port}/"):
                 engine.install_prebuilt(lambda value: stages.append(value["stage"]))
-            assert engine.image_ids() == meta["images"]
+            assert engine.image_ids() == resolved
             assert all(stage in stages for stage in ("manifest", "download", "verify", "import", "done"))
             # Repeat installation must use verified local images without any network.
             with patch.object(downloads, "client", side_effect=AssertionError("Unexpected repeat download")):
                 engine.install_prebuilt()
-            assert docker.inspect("image", tag)["Id"] == meta["images"]["work"]
+            assert docker.inspect("image", tag)["Id"] == resolved["work"]
             assert docker.inspect("container", name)["Id"] == existing
             # Inspect the existing writable layer without starting a replacement.
             docker.run("cp", name + ":/tmp/ewb-preserved", str(Path(private) / "preserved"))

@@ -113,6 +113,23 @@ jobs:
         env:
           PYTHONPATH: windows
         run: python -u tests/integration_prebuilt.py --context default --directory "$RUNNER_TEMP/runtime-package"
+      - name: Verify archive with the classic Docker store
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/windows-ux'
+        env:
+          PYTHONPATH: windows
+        run: |
+          ewbClassicRoot="$RUNNER_TEMP/ewb-classic"
+          mkdir -p "$ewbClassicRoot"
+          printf '%s' '{"features":{"containerd-snapshotter":false}}' > "$ewbClassicRoot/daemon.json"
+          sudo dockerd --config-file "$ewbClassicRoot/daemon.json" --data-root "$ewbClassicRoot/data" --exec-root "$ewbClassicRoot/exec" --pidfile "$ewbClassicRoot/daemon.pid" --host "unix://$ewbClassicRoot/docker.sock" --bridge=none --iptables=false --ip6tables=false --storage-driver=overlay2 > "$ewbClassicRoot/daemon.log" 2>&1 &
+          ewbDaemonJob=$!
+          trap 'sudo kill "$(cat "$ewbClassicRoot/daemon.pid")" || true; wait "$ewbDaemonJob" || true' EXIT
+          for attempt in $(seq 1 60); do
+            if docker --host "unix://$ewbClassicRoot/docker.sock" info > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker context create ewb-archive-classic --docker "host=unix://$ewbClassicRoot/docker.sock"
+          python -u tests/integration_prebuilt.py --context ewb-archive-classic --directory "$RUNNER_TEMP/runtime-package"
       - name: Stage verified runtime files
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/windows-ux'
         uses: actions/github-script@v7

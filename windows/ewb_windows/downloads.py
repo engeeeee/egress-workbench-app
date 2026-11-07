@@ -38,6 +38,8 @@ def manifest(platform, recipes, proxy=None):
             raise ValueError()
         if set(value["images"]) != {"gateway", "work", "browser"} or not all(re.fullmatch(r"sha256:[a-f0-9]{64}", x) for x in value["images"].values()):
             raise ValueError()
+        if set(value["image_configs"]) != set(value["images"]) or not all(re.fullmatch(r"sha256:[a-f0-9]{64}", x) for x in value["image_configs"].values()):
+            raise ValueError()
         if not re.fullmatch(r"[a-f0-9]{64}", value["sha256"]) or not 0 < int(value["bytes"]) < 2 * 1024**3:
             raise ValueError()
         expected = "Egress-Workbench-Runtime-" + platform.replace("/", "-") + "-" + __version__ + ".tar.gz"

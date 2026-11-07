@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import tarfile
 import tempfile
 
 from ewb_windows import __version__
@@ -37,7 +38,26 @@ def main():
     assert process.wait() == 0
     with archive.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    manifest = {"schema": 1, "version": __version__, "platform": "linux/amd64", "filename": filename, "bytes": archive.stat().st_size, "sha256": digest, "recipes": report["recipes"], "images": report["images"]}
+    # Classic stores identify images by configuration digest; containerd uses the
+    # OCI manifest. Preserve both exact identifiers from the verified archive.
+    configs = {}
+    with tarfile.open(archive, "r|gz") as tar:
+        for member in tar:
+            if not member.isfile() or member.size > 1024 * 1024 or member.size < 2:
+                continue
+            data = tar.extractfile(member).read()
+            try:
+                config = json.loads(data)
+            except (ValueError, UnicodeError):
+                continue
+            if not isinstance(config, dict) or "rootfs" not in config:
+                continue
+            recipe = (config.get("config", {}).get("Labels") or {}).get(RECIPE)
+            for role, expected in report["recipes"].items():
+                if recipe == expected:
+                    configs[role] = "sha256:" + hashlib.sha256(data).hexdigest()
+    assert set(configs) == set(report["images"])
+    manifest = {"schema": 1, "version": __version__, "platform": "linux/amd64", "filename": filename, "bytes": archive.stat().st_size, "sha256": digest, "recipes": report["recipes"], "images": report["images"], "image_configs": configs}
     (args.output / filename.replace(".tar.gz", ".json")).write_text(json.dumps(manifest, indent=2) + "\n")
     (args.output / (filename + ".sha256")).write_text(digest + "  " + filename + "\n")
     print(json.dumps({"filename": filename, "bytes": archive.stat().st_size, "sha256": digest}))
