@@ -1,0 +1,413 @@
+from __future__ import annotations
+
+import ipaddress
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import webbrowser
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from .state import Store, WorkbenchError, fingerprint
+
+OWNER = "io.egress-workbench.windows.instance"
+ROLE = "io.egress-workbench.windows.role"
+RECIPE = "io.egress-workbench.windows.recipe"
+GATEWAY_IMAGE = "ghcr.io/sagernet/sing-box:v1.14.3"
+RESOURCES = Path(__file__).resolve().parent.parent / "containers"
+HIDDEN = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+class Docker:
+    def __init__(self, context: str):
+        candidates = [shutil.which("docker")]
+        if os.name == "nt":
+            candidates += [str(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Docker/Docker/resources/bin/docker.exe")]
+            candidates += [str(Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/DockerDesktop/resources/bin/docker.exe")]
+        self.executable = next((x for x in candidates if x and Path(x).is_file()), None)
+        self.context = context
+
+    def command(self, *args) -> list[str]:
+        if not self.executable:
+            raise WorkbenchError("未找到 Docker Desktop，请安装并启动 Docker Desktop，切换到 Linux containers。")
+        return [self.executable, "--context", self.context, *map(str, args)]
+
+    @staticmethod
+    def environment():
+        return {k: v for k, v in os.environ.items() if k not in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH")}
+
+    def run(self, *args, timeout=60, log: Path | None = None) -> str:
+        try:
+            if log:
+                with log.open("a", encoding="utf-8") as stream:
+                    result = subprocess.run(self.command(*args), stdout=stream, stderr=subprocess.STDOUT, timeout=timeout, env=self.environment(), creationflags=HIDDEN)
+                output, error = "", f"详细日志：{log}"
+            else:
+                result = subprocess.run(self.command(*args), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=self.environment(), creationflags=HIDDEN)
+                output, error = result.stdout, result.stderr.strip()[-1500:]
+        except subprocess.TimeoutExpired as error:
+            raise WorkbenchError("Docker 操作超时，请检查 Docker Desktop 状态及运行日志。") from error
+        except OSError as error:
+            raise WorkbenchError("Docker 无法启动，请检查 Docker Desktop 安装。") from error
+        if result.returncode:
+            raise WorkbenchError("Docker 操作失败：" + error)
+        return output.strip()
+
+    def inspect(self, kind: str, name: str):
+        try:
+            return json.loads(self.run(kind, "inspect", name))[0]
+        except WorkbenchError as error:
+            if any(x in str(error).lower() for x in ("no such", "not found")):
+                return None
+            raise
+
+
+class Engine:
+    def __init__(self, store: Store, log=lambda message: None):
+        self.store, self.log = store, log
+        self.settings = store.settings()
+        self.docker = Docker(self.settings["context"])
+        self.prefix = "ewbw-" + store.instance
+        self.internal, self.external = self.prefix + "-internal", self.prefix + "-external"
+        self.recipe = fingerprint({str(p.relative_to(RESOURCES)): p.read_text(encoding="utf-8") for p in sorted(RESOURCES.rglob("*")) if p.is_file() and "__pycache__" not in str(p)})[:12]
+        self.images = {role: "ewb-windows/" + role + ":" + self.recipe for role in ("gateway", "work", "browser")}
+
+    def owned(self, obj, role: str | None = None):
+        labels = obj.get("Config", {}).get("Labels", obj.get("Labels")) or {}
+        if labels.get(OWNER) != self.store.instance or (role and labels.get(ROLE) != role):
+            raise WorkbenchError("资源归属不一致，已停止操作；未修改其他 Docker 资源。")
+        return obj
+
+    def inspect(self, role: str, name: str | None = None):
+        obj = self.docker.inspect("container", name or self.prefix + "-" + role)
+        return self.owned(obj, role) if obj else None
+
+    def doctor(self) -> dict:
+        context = json.loads(self.docker.run("context", "inspect", self.docker.context))[0]
+        endpoint = context.get("Endpoints", {}).get("docker", {}).get("Host", "")
+        if not endpoint.startswith(("npipe://", "unix://")):
+            raise WorkbenchError("请选择本机 Docker Desktop 上下文；此版本不支持远程 Docker。")
+        info = json.loads(self.docker.run("info", "--format", "{{json .}}"))
+        if info.get("OSType") != "linux":
+            raise WorkbenchError("Docker 当前未使用 Linux containers，请在 Docker Desktop 中切换。")
+        if int(info.get("ServerVersion", "0").split(".")[0]) < 28:
+            raise WorkbenchError("需要 Docker Engine 28 或更新版本，请更新 Docker Desktop。")
+        arch = info.get("Architecture", "")
+        if arch not in ("x86_64", "amd64", "aarch64", "arm64"):
+            raise WorkbenchError("仅支持 x64 或 ARM64 的 Linux 容器引擎。")
+        return {"docker": info.get("ServerVersion"), "architecture": arch, "context": self.docker.context, "data": str(self.store.home)}
+
+    def install(self):
+        with self.store.lock():
+            self.doctor()
+            self.networks()
+            build_log = self.store.home / "build.log"
+            for role in ("gateway", "work", "browser"):
+                item = self.docker.inspect("image", self.images[role])
+                if item and (item.get("Config", {}).get("Labels") or {}).get(RECIPE) == self.recipe:
+                    self.log(role + " 镜像已就绪。")
+                    continue
+                self.log("构建 " + role + " 镜像；首次安装需要下载工具和 Chromium…")
+                self.docker.run("build", "--network", self.external, "--label", RECIPE + "=" + self.recipe, "--build-arg", "WORK_IMAGE=" + self.images["work"], "-f", str(RESOURCES / ("Dockerfile." + role)), "-t", self.images[role], str(RESOURCES), timeout=2400, log=build_log)
+            self.store.write("images.json", {role: self.docker.inspect("image", name)["Id"] for role, name in self.images.items()})
+            self.log("环境安装完成。请导入节点，再检查和确认连接。")
+
+    def image_ids(self):
+        expected = self.store.read("images.json", {})
+        if set(expected) != set(self.images):
+            raise WorkbenchError("请先安装运行环境。")
+        for role, name in self.images.items():
+            obj = self.docker.inspect("image", name)
+            if not obj or obj["Id"] != expected[role]:
+                raise WorkbenchError("运行镜像缺失或版本发生变化，请重新安装运行环境并检查连接。")
+        return expected
+
+    def save_nodes(self, nodes: list[dict]):
+        with self.store.lock():
+            self._stop("已导入新节点，请重新检查和确认连接。")
+            self.store.write("nodes.json", nodes)
+            settings = self.store.settings()
+            settings["selected"] = nodes[0]["id"]
+            self.store.write("settings.json", settings)
+
+    def save_settings(self, selected: str, timezone: str, context: str):
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise WorkbenchError("请填写有效的 IANA 时区，例如 America/Los_Angeles。") from error
+        if not context.strip() or context.startswith("-"):
+            raise WorkbenchError("Docker 上下文名称无效。")
+        with self.store.lock():
+            old = self.store.settings()
+            if old.get("context") != context and self.store.read("images.json"):
+                raise WorkbenchError("已安装的环境不能切换 Docker 上下文。请使用新的专用数据目录。")
+            established = self.store.read("environment.json")
+            if established and established["timezone"] != timezone:
+                raise WorkbenchError("已有持久化环境的时区固定。改变时区请使用新的专用数据目录。")
+            if (old["selected"], old["timezone"], old["context"]) != (selected, timezone, context):
+                self._stop("设置已更新，请重新检查连接。")
+            self.store.write("settings.json", {**old, "selected": selected, "timezone": timezone, "context": context})
+
+    def node(self):
+        selected = self.store.settings()["selected"]
+        node = next((n for n in self.store.read("nodes.json", []) if n["id"] == selected), None)
+        if not node:
+            raise WorkbenchError("请先导入并选择节点。")
+        from .nodes import normalize
+        try:
+            validated = normalize(node["outbound"], node["label"])
+            if validated["id"] != node["id"]:
+                raise ValueError()
+            return validated
+        except (ValueError, KeyError, TypeError) as error:
+            raise WorkbenchError("保存的节点配置无效或发生变化，请重新导入节点。") from error
+
+    def policy(self):
+        settings = self.store.settings()
+        return fingerprint({"node": self.node(), "timezone": settings["timezone"], "context": settings["context"], "recipe": self.recipe})
+
+    def networks(self):
+        for name, internal in ((self.internal, True), (self.external, False)):
+            obj = self.docker.inspect("network", name)
+            if not obj:
+                args = ["network", "create", "--label", OWNER + "=" + self.store.instance]
+                if internal:
+                    args.append("--internal")
+                self.docker.run(*args, name)
+                obj = self.docker.inspect("network", name)
+            self.owned(obj)
+            if obj.get("Internal") != internal or obj.get("Driver") != "bridge" or obj.get("EnableIPv6"):
+                raise WorkbenchError("容器网络的隔离配置不一致。")
+        config = self.docker.inspect("network", self.internal)["IPAM"]["Config"]
+        subnet = next(ipaddress.ip_network(x["Subnet"]) for x in config if ":" not in x["Subnet"])
+        return str(subnet[2]), str(subnet[3])
+
+    def ensure_container(self, role, image, arguments, command=(), name=None):
+        name = name or self.prefix + "-" + role
+        obj = self.inspect(role, name)
+        if obj:
+            if obj["Image"] != image:
+                raise WorkbenchError("已有容器的镜像与本版本不同。请保留数据，使用新的专用数据目录。")
+            if not obj["State"]["Running"]:
+                self.docker.run("start", name)
+            return self.inspect(role, name)
+        common = ["run", "-d", "--name", name, "--label", OWNER + "=" + self.store.instance, "--label", ROLE + "=" + role, "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512", "--env", "TZ=" + self.store.settings()["timezone"]]
+        self.docker.run(*common, *arguments, image, *command)
+        return self.inspect(role, name)
+
+    def setup(self):
+        ids = self.image_ids()
+        gateway_ip, session_ip = self.networks()
+        outbound = dict(self.node()["outbound"])
+        try:
+            answers = socket.getaddrinfo(outbound["server"], outbound["server_port"], socket.AF_INET, socket.SOCK_STREAM)
+            outbound["server"] = answers[0][4][0]
+        except OSError as error:
+            raise WorkbenchError("本机无法解析节点的 IPv4 地址。") from error
+        directory = self.store.home / "gateway"
+        directory.mkdir(exist_ok=True)
+        config = {"log": {"level": "warn"}, "inbounds": [{"type": "mixed", "tag": "clients", "listen": gateway_ip, "listen_port": 2080}], "outbounds": [outbound], "route": {"final": "selected"}}
+        from .state import atomic_json
+        atomic_json(directory / "config.json", config)
+        atomic_json(directory / "lease.json", {"expires": time.time() + 300})
+        gateway = self.ensure_container("gateway", ids["gateway"], ["--network", self.internal, "--ip", gateway_ip, "--read-only", "--tmpfs", "/tmp", "--mount", f"type=bind,source={directory},target=/config,readonly"], ["run", "-c", "/config/config.json"])
+        if self.external not in gateway["NetworkSettings"]["Networks"]:
+            self.docker.run("network", "connect", "--gw-priority", "1", self.external, gateway["Id"])
+        session = self.ensure_container("session", ids["work"], ["--network", self.internal, "--ip", session_ip, "--dns", "127.0.0.1", "--publish", "127.0.0.1::6080", "--read-only", "--tmpfs", "/tmp", "--memory", "128m"], ["sleep", "infinity"])
+        self.store.write("environment.json", {"timezone": self.store.settings()["timezone"]})
+        return {"gateway": gateway["Id"], "session": session["Id"], "proxy": f"http://{gateway_ip}:2080", "config_hash": fingerprint(config)}
+
+    def probe(self, state):
+        output = self.docker.run("run", "--rm", "--network", "container:" + state["session"], "--cap-drop", "ALL", "--security-opt", "no-new-privileges", self.image_ids()["work"], "python3", "/opt/ewb/probe.py", state["proxy"], timeout=80)
+        try:
+            result = json.loads(output)
+            ipaddress.IPv4Address(result["ip"])
+            if result.get("direct_blocked") is not True:
+                raise ValueError("direct connection allowed")
+            return result
+        except (ValueError, KeyError) as error:
+            raise WorkbenchError("出口核对或直连阻断检查未通过。") from error
+
+    def check(self):
+        with self.store.lock():
+            self.doctor()
+            self._stop("正在检查连接。")
+            try:
+                state = self.setup()
+                self.log("通过所选节点核对两个出口来源，并检查容器直连是否被阻断…")
+                evidence = self.probe(state)
+                state.update({"phase": "review", "policy": self.policy(), "checked": time.time(), "evidence": evidence})
+                self.store.write("runtime.json", state)
+                return evidence
+            except Exception:
+                self._stop("连接检查失败，环境已停止。")
+                raise
+
+    def audit_topology(self, state):
+        session, gateway = self.inspect("session"), self.inspect("gateway")
+        if not session or not gateway or session["Id"] != state["session"] or gateway["Id"] != state["gateway"] or not session["State"]["Running"] or not gateway["State"]["Running"]:
+            raise WorkbenchError("容器已停止或重新创建，请重新检查和确认连接。")
+        if set(session["NetworkSettings"]["Networks"]) != {self.internal} or set(gateway["NetworkSettings"]["Networks"]) != {self.internal, self.external}:
+            raise WorkbenchError("检测到容器网络发生变化。")
+        if not self.owned(self.docker.inspect("network", self.internal)).get("Internal"):
+            raise WorkbenchError("内部网络隔离已改变。")
+        config = self.store.read("gateway/config.json")
+        if fingerprint(config) != state["config_hash"] or self.policy() != state["policy"]:
+            raise WorkbenchError("节点或运行配置已改变，请重新检查。")
+        for name in self.managed():
+            obj = self.docker.inspect("container", name)
+            self.owned(obj)
+            role = obj["Config"]["Labels"][ROLE]
+            if role in ("project", "browser") and obj["HostConfig"]["NetworkMode"] != "container:" + state["session"]:
+                raise WorkbenchError("工作容器的网络空间已改变。")
+
+    def confirm(self):
+        with self.store.lock():
+            state = self.store.read("runtime.json", {})
+            try:
+                if state.get("phase") != "review" or time.time() - state["checked"] > 300:
+                    raise WorkbenchError("检查结果已过期，请重新检查节点。")
+                self.audit_topology(state)
+                evidence = self.probe(state)
+                if evidence["ip"] != state["evidence"]["ip"]:
+                    raise WorkbenchError("复核时出口 IP 已改变，请重新检查和核对。")
+                state.update({"phase": "ready", "evidence": evidence, "heartbeat": time.time(), "confirmed": time.time(), "browser_token": secrets.token_hex(32)})
+                self.store.write("gateway/lease.json", {"expires": time.time() + 180})
+                self.store.write("runtime.json", state)
+                self.start_guard()
+                return evidence
+            except Exception:
+                self._stop("连接尚未确认，环境已停止。")
+                raise
+
+    def start_guard(self):
+        args = ([sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "ewb_windows"])
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS if os.name == "nt" else 0
+        with (self.store.home / "guard.log").open("a", encoding="utf-8") as log:
+            subprocess.Popen([*args, "--data", str(self.store.home), "guard"], stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=os.environ.copy(), cwd=str(Path(__file__).resolve().parent.parent), creationflags=flags, start_new_session=os.name != "nt")
+
+    def ready(self):
+        state = self.store.read("runtime.json", {})
+        if state.get("phase") != "ready":
+            raise WorkbenchError("请先检查节点、核对出口 IP 并确认连接。")
+        try:
+            self.audit_topology(state)
+            if time.time() - state.get("heartbeat", 0) > 100:
+                raise WorkbenchError("连接监测进程已失联，请重新检查连接。")
+            result = self.probe(state)
+            if result["ip"] != state["evidence"]["ip"]:
+                raise WorkbenchError("检测到出口 IP 改变，环境已停止。")
+            state["heartbeat"] = time.time()
+            self.store.write("gateway/lease.json", {"expires": time.time() + 180})
+            self.store.write("runtime.json", state)
+            return state
+        except Exception:
+            self._stop("连接监测未通过，请重新检查节点。")
+            raise
+
+    def guard(self):
+        try:
+            with self.store.lock("guard"):
+                while self.store.read("runtime.json", {}).get("phase") == "ready":
+                    try:
+                        with self.store.lock():
+                            self.ready()
+                    except WorkbenchError:
+                        if self.store.read("runtime.json", {}).get("phase") != "ready":
+                            break
+                    time.sleep(30)
+        except WorkbenchError:
+            pass
+
+    def managed(self):
+        return self.docker.run("ps", "-aq", "--filter", "label=" + OWNER + "=" + self.store.instance).splitlines()
+
+    def _stop(self, reason="环境已停止，账号和项目数据已保留。"):
+        self.store.write("runtime.json", {"phase": "stopped", "reason": reason})
+        self.store.write("gateway/lease.json", {"expires": 0})
+        if not self.docker.executable or not self.store.read("images.json"):
+            return
+        # Stop the gateway first: an unconfirmed state must not leave an outbound route.
+        objects = [self.owned(self.docker.inspect("container", name)) for name in self.managed()]
+        objects.sort(key=lambda o: o["Config"]["Labels"][ROLE] != "gateway")
+        failures = []
+        for obj in objects:
+            if obj["State"]["Running"]:
+                try:
+                    self.docker.run("stop", "--time", "8", obj["Id"], timeout=25)
+                except WorkbenchError:
+                    failures.append(obj["Id"])
+        if failures:
+            # A failed graceful stop still has to close this installation's network.
+            for identifier in failures:
+                self.docker.run("kill", identifier, timeout=15)
+
+    def stop(self):
+        with self.store.lock():
+            self._stop()
+
+    def proxy_env(self, state):
+        result = []
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            result += ["--env", key + "=" + state["proxy"]]
+        return [*result, "--env", "NO_PROXY=localhost,127.0.0.1,::1", "--env", "no_proxy=localhost,127.0.0.1,::1", "--env", "EWB_BROWSER_TOKEN=" + state["browser_token"], "--env", "BROWSER=/usr/local/bin/xdg-open", "--env", "TZ=" + self.store.settings()["timezone"]]
+
+    def _browser(self, state):
+        ids = self.image_ids()
+        # A stopped browser may contain an old one-time display token. Replace its
+        # container, keeping its profile and downloads in dedicated persistent volumes.
+        old = self.inspect("browser")
+        if old and not old["State"]["Running"]:
+            self.docker.run("rm", old["Id"])
+        obj = self.ensure_container("browser", ids["browser"], ["--network", "container:" + state["session"], "--shm-size", "512m", "--memory", "2g", "--volume", self.prefix + "-browser-home:/home/workspace", "--volume", self.prefix + "-downloads:/home/workspace/Downloads", *self.proxy_env(state)])
+        ports = self.inspect("session")["NetworkSettings"]["Ports"]["6080/tcp"]
+        if not ports or ports[0]["HostIp"] != "127.0.0.1":
+            raise WorkbenchError("浏览器显示端口未限定为本机。")
+        token = urllib.parse.quote("websockify?token=" + state["browser_token"], safe="")
+        return f"http://127.0.0.1:{ports[0]['HostPort']}/vnc.html?autoconnect=true&resize=scale&path={token}"
+
+    def browser(self):
+        with self.store.lock():
+            state = self.ready()
+            url = self._browser(state)
+        webbrowser.open(url)
+        return url
+
+    def _project(self, path, state):
+        directory, key = self.store.project(path)
+        name = self.prefix + "-project-" + key
+        ids = self.image_ids()
+        obj = self.ensure_container("project", ids["work"], ["--network", "container:" + state["session"], "--memory", "4g", "--mount", f"type=bind,source={directory},target=/workspace/{key}", "--volume", self.prefix + "-tools-home:/home/workspace", "--workdir", "/workspace/" + key, *self.proxy_env(state)], name=name)
+        settings = self.store.settings()
+        settings["projects"] = list(dict.fromkeys([*settings["projects"], str(directory)]))
+        self.store.write("settings.json", settings)
+        return obj, key
+
+    def tool_command(self, path, command, interactive=True):
+        with self.store.lock():
+            state = self.ready()
+            self._browser(state)
+            obj, key = self._project(path, state)
+            flags = ["-it"] if interactive else ["-i"]
+            return self.docker.command("exec", *flags, "--workdir", "/workspace/" + key, *self.proxy_env(state), obj["Id"], *command)
+
+    def terminal(self, path, tool):
+        commands = {"claude": ["claude"], "codex": ["codex"], "shell": ["bash", "-l"], "login-claude": ["claude", "auth", "login"], "login-codex": ["codex", "login"]}
+        if tool not in commands:
+            raise WorkbenchError("未知工具。")
+        command = self.tool_command(path, commands[tool])
+        if os.name != "nt":
+            raise WorkbenchError("此按钮在 Windows 中打开终端；其他系统请使用命令行入口。")
+        subprocess.Popen(command, creationflags=subprocess.CREATE_NEW_CONSOLE, env=self.docker.environment())
+        # Open the viewer so any account authorization URL stays in Chromium.
+        self.browser()
+
+    def status(self):
+        state = self.store.read("runtime.json", {"phase": "stopped"})
+        return {"phase": state["phase"], "reason": state.get("reason", ""), "evidence": state.get("evidence"), "checked": state.get("checked"), "confirmed": state.get("confirmed"), "guard_age": round(time.time() - state.get("heartbeat", time.time())), "timezone": self.store.settings()["timezone"]}

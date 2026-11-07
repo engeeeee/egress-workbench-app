@@ -3,6 +3,8 @@
 <p align="center">One working environment for Claude Code, Codex and Chromium.</p>
 <p align="center"><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
 
+> **Windows preview implementation:** this branch adds a rebuilt Windows host and native-architecture Linux container recipes. See [Windows setup and build instructions](windows/README.zh-CN.md). The original macOS release described below is maintained separately.
+
 Egress Workbench is a **fingerprint runtime environment** for macOS, providing Claude Code, Codex and shared Chromium with a common network exit, configured time zone and persistent workspaces.
 
 Tools run in Linux and can read and edit the project folder you select on your Mac. Software, sign-ins and conversation state survive ordinary environment stops and restarts, so you can continue working on existing projects.

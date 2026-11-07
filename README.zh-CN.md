@@ -3,6 +3,8 @@
 <p align="center">让 Claude Code、Codex 与浏览器在统一的工作环境中运行。</p>
 <p align="center"><a href="README.md">English</a> · <strong>简体中文</strong></p>
 
+> **Windows 预览实现：** 本分支新增 [Windows 版源码、启动及打包说明](windows/README.zh-CN.md)。它使用重新实现的主机控制层与原生架构 Linux 容器，和下方介绍的原版 macOS 安装包分别维护。
+
 Egress Workbench 是面向 macOS 的**指纹运行环境**，为 Claude Code、Codex 和共享 Chromium 提供统一的网络出口、时区配置与持久化工作空间。
 
 工具运行在 Linux 环境中，可以读写你在 Mac 上选定的项目目录。普通停止和重启会保留软件、登录与会话状态，让你继续处理已有项目。
