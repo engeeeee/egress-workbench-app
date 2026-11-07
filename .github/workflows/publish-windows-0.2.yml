@@ -1,0 +1,109 @@
+name: Publish verified Windows 0.2
+
+on:
+  push:
+    branches: [windows-release-0.2.0]
+    paths: ['.github/workflows/publish-windows-0.2.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-windows-0.2.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the tested Windows package
+        uses: actions/download-artifact@v4
+        with:
+          name: Egress-Workbench-Windows-x64-0.2.0
+          run-id: 42406522962
+          github-token: ${{ github.token }}
+          path: verified-package
+      - name: Verify and publish
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            const {owner, repo} = context.repo;
+            if (owner !== 'engeeeee' || repo !== 'egress-workbench-app') throw new Error('Wrong repository.');
+            const source = '5499e33f5c06c978c5af414bc94c048a37c8b0d4';
+            const target = '5127518be9bd26e46e5ae1e7f43826dd8ea35ab2';
+            const runId = 42406522962;
+            const tag = 'v0.2.0-windows';
+            const expected = {"Egress-Workbench-Windows-x64-0.2.0-Portable.zip":{"bytes":21340686,"sha256":"eb022f48d529dddc67cf615141d570475c3e5e5b374db120b79e4cd4fe194c27"},"Egress-Workbench-Windows-x64-0.2.0-Setup.exe":{"bytes":15291079,"sha256":"c2ec5486f3c9dc918c44f0e07c8959897c912bcc80fa5e5611e0152df4a49ce9"}};
+            const expectedRuntime = {"Egress-Workbench-Runtime-linux-amd64-0.2.0.json":{"bytes":924,"sha256":"dc4e5c2de81a5613b908ad2efac02bd6de059677c200ff1c6c5dde8cb8c10589"},"Egress-Workbench-Runtime-linux-amd64-0.2.0.tar.gz":{"bytes":949384951,"sha256":"c162b0c07186de9446ca0911bd2e4222a2cef7527d41256e423b79a65add1062"},"Egress-Workbench-Runtime-linux-amd64-0.2.0.tar.gz.sha256":{"bytes":116,"sha256":"7489a9eea0c8fa998a032b5cb51c2f78c2f0c5dca2025dd1b55485469a6f3e2e"}};
+            const sha = data => crypto.createHash('sha256').update(data).digest('hex');
+            const run = (await github.rest.actions.getWorkflowRun({owner, repo, run_id: runId})).data;
+            if (run.head_sha !== source || run.status !== 'completed' || run.conclusion !== 'success') throw new Error('Source build has not passed.');
+            const jobs = (await github.rest.actions.listJobsForWorkflowRun({owner, repo, run_id: runId})).data.jobs;
+            if (jobs.length !== 4 || jobs.some(j => j.conclusion !== 'success')) throw new Error('Required jobs did not all pass.');
+            const compare = (await github.rest.repos.compareCommits({owner, repo, base: source, head: target})).data;
+            if (!['identical', 'ahead'].includes(compare.status) || compare.files.some(f => !f.filename.startsWith('docs/'))) throw new Error('Release target changed tested application code.');
+            const releases = (await github.rest.repos.listReleases({owner, repo, per_page: 100})).data;
+            const release = releases.find(r => r.tag_name === tag);
+            if (!release || !release.draft) throw new Error('Expected an unpublished runtime draft.');
+            const assets = (await github.rest.repos.listReleaseAssets({owner, repo, release_id: release.id})).data;
+            for (const [name, spec] of Object.entries(expectedRuntime)) {
+              const asset = assets.find(a => a.name === name);
+              if (!asset || asset.size !== spec.bytes || asset.digest !== 'sha256:' + spec.sha256) throw new Error('Runtime asset changed: ' + name);
+            }
+            let existingTag;
+            try { existingTag = (await github.rest.git.getRef({owner, repo, ref: 'tags/' + tag})).data; }
+            catch (e) { if (e.status !== 404) throw e; }
+            if (existingTag && existingTag.object.sha !== target) throw new Error('Existing tag points to a different source.');
+            const payloads = [];
+            for (const [name, spec] of Object.entries(expected)) {
+              const data = fs.readFileSync('verified-package/' + name);
+              if (data.length !== spec.bytes || sha(data) !== spec.sha256) throw new Error('Package differs from checked build: ' + name);
+              const checksum = fs.readFileSync('verified-package/' + name + '.sha256');
+              if (checksum.toString('utf8').trim() !== spec.sha256 + '  ' + name) throw new Error('Checksum file differs: ' + name);
+              payloads.push([name, data], [name + '.sha256', checksum]);
+            }
+            for (const [name, data] of payloads) {
+              const previous = assets.find(a => a.name === name);
+              if (previous) {
+                if (previous.size !== data.length || previous.digest !== 'sha256:' + sha(data)) throw new Error('Existing package differs: ' + name);
+                continue;
+              }
+              await github.rest.repos.uploadReleaseAsset({owner, repo, release_id: release.id, name, data, headers: {'content-type': name.endsWith('.zip') ? 'application/zip' : 'application/octet-stream', 'content-length': data.length}});
+            }
+            const body = [
+              'Windows x64 0.2.0 预览版：更新中文桌面界面、启动和图标，增加安装程序、可续传的运行环境下载，以及本机线路到落地的代理链。',
+              '',
+              '### 下载与启动',
+              '',
+              '**推荐下载 `Egress-Workbench-Windows-x64-0.2.0-Setup.exe`**：当前用户安装，带开始菜单和桌面快捷方式，无需另装 Python。免安装版 `Portable.zip` 完整解压后运行根目录 `EgressWorkbench.exe`，保留 `_internal`。',
+              '',
+              '需要 Docker Desktop（WSL 2 / Linux containers，Engine 28 或更新）。运行环境约 0.95 GB，在“下载与安装”页自动获取、校验和导入；无需手工下载 runtime 文件。安装包尚未代码签名。',
+              '',
+              '### 本机线路 + 落地',
+              '',
+              '在“连接与代理”添加 SOCKS5 / HTTP / HTTPS 落地（支持用户名、密码），开启“通过本机代理连接落地”，填写线路客户端的本机地址，如 `http://127.0.0.1:7890`。连接方向为：**本机线路 → 落地代理 → 目标服务**；核对的是落地出口，无需开放局域网端口。速度取决于实际线路质量。',
+              '',
+              '支持批量导入、读取系统代理、下载复用本机线路；线路断开或出口变化被检测后停止环境，不自动改为直连。',
+              '',
+              '### 界面与安装体验',
+              '',
+              '- 新工作台、连接路径与状态、项目工作区、独立下载页及日志。',
+              '- 首屏显示后后台检测 Docker；DPI、多尺寸图标、单实例和快捷方式。',
+              '- 预构建环境包显示下载进度、速度、预计时间，可暂停、断点续传并校验 SHA-256。',
+              '- 支持 Docker classic / containerd 存储；重复安装保留已有镜像标签与容器数据。',
+              '- 从 0.1.0 升级先停止环境并退出旧窗口，安装后更新运行环境并重新核对连接；项目、账号和浏览器数据保留。',
+              '',
+              '### 验证与边界',
+              '',
+              'Windows / Linux 各 39 项自动检查、Windows 打包 GUI / CLI 启动、安装卸载与数据保留、原生 x64 容器、带认证 SOCKS5 / HTTP 落地双层代理、线路失效阻断，以及两种 Docker 存储的环境包安装均通过。HTTPS 代理已验证配置导入与 TLS 参数保留，尚未做真实服务商 HTTPS 落地联机验收。',
+              '',
+              '尚未在真实 Windows 11 + Docker Desktop 桌面完成整套交互验收，也未使用真实 Anthropic / OpenAI 账号登录或请求模型。Chromium 使用 `--no-sandbox`；完整支持范围和限制见说明。',
+              '',
+              '[使用说明](https://github.com/' + owner + '/' + repo + '/blob/' + tag + '/windows/README.zh-CN.md) · [验证与界面截图](https://github.com/' + owner + '/' + repo + '/blob/' + tag + '/docs/windows-0.2-validation.zh-CN.md) · [通过的构建](https://github.com/' + owner + '/' + repo + '/actions/runs/' + runId + ')',
+            ].join('\n');
+            const published = (await github.rest.repos.updateRelease({owner, repo, release_id: release.id, target_commitish: target, name: 'Egress Workbench Windows 0.2.0 Preview', body, draft: false, prerelease: true, make_latest: 'false'})).data;
+            core.notice('Published ' + published.html_url);
