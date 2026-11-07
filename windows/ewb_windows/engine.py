@@ -221,7 +221,7 @@ class Engine:
         from .state import atomic_json
         atomic_json(directory / "config.json", config)
         atomic_json(directory / "lease.json", {"expires": time.time() + 300})
-        gateway = self.ensure_container("gateway", ids["gateway"], ["--network", self.internal, "--ip", gateway_ip, "--read-only", "--tmpfs", "/tmp", "--mount", f"type=bind,source={directory},target=/config,readonly"], ["run", "-c", "/config/config.json"])
+        gateway = self.ensure_container("gateway", ids["gateway"], ["--user", str(getattr(os, "getuid", lambda: 0)()), "--network", self.internal, "--ip", gateway_ip, "--read-only", "--tmpfs", "/tmp", "--mount", f"type=bind,source={directory},target=/config,readonly"], ["run", "-c", "/config/config.json"])
         if self.external not in gateway["NetworkSettings"]["Networks"]:
             self.docker.run("network", "connect", "--gw-priority", "1", self.external, gateway["Id"])
         session = self.ensure_container("session", ids["work"], ["--network", self.internal, "--ip", session_ip, "--dns", "127.0.0.1", "--read-only", "--tmpfs", "/tmp", "--memory", "128m"], ["sleep", "infinity"])

@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [windows-preview]
+    paths: ['windows/**', 'tests/**', '.github/workflows/windows-preview.yml']
   pull_request:
     paths: ['windows/**', 'tests/**', '.github/workflows/windows-preview.yml']
 
