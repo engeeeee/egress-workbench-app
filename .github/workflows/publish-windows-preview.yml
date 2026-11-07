@@ -1,0 +1,115 @@
+name: Publish verified Windows preview
+
+on:
+  push:
+    branches: [windows-release-0.1.0]
+    paths: ['.github/workflows/publish-windows-preview.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-windows-0.1.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the tested Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Egress-Workbench-Windows-x64
+          run-id: 42378568840
+          github-token: ${{ github.token }}
+          path: verified-package
+      - name: Verify and publish the release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            if (owner !== 'engeeeee' || repo !== 'egress-workbench-app') {
+              throw new Error('This publisher is scoped to the requested repository.');
+            }
+            const tag = 'v0.1.0-windows';
+            const source = '04ea28cba20f15a552dcc74f76e7d0ecc0863f54';
+            const filename = 'Egress-Workbench-Windows-x64-0.1.0.zip';
+            const expected = 'f54f77987f24976c3087aab35b545873416402869f72fff70fcdb4929f586ffd';
+            const payload = fs.readFileSync('verified-package/' + filename);
+            const actual = crypto.createHash('sha256').update(payload).digest('hex');
+            if (actual !== expected || payload.length !== 32331704) {
+              throw new Error('The release ZIP does not match the verified build.');
+            }
+            const body = [
+              'Windows x64 功能预览版，提供中文桌面界面、节点导入与出口确认、Claude Code / Codex 项目终端，以及持久化共享 Chromium。',
+              '',
+              '### 下载与使用',
+              '',
+              '下载下方 Assets 中的 `' + filename + '`，完整解压后运行 `EgressWorkbench/EgressWorkbench.exe`。请保留旁边的 `_internal` 文件夹。命令行入口为 `ewb/ewb.exe`；打包版本无需另外安装 Python。',
+              '',
+              '需要已运行的 Docker Desktop（WSL 2 / Linux containers，Docker Engine 28 或更新）。建议使用 x64 Windows 11。首次使用会在线构建运行环境；随后导入节点、检查并确认出口，再选择项目。',
+              '',
+              '### 验证与范围',
+              '',
+              '- Windows / Linux 各 26 项自动检查通过。',
+              '- Windows x64 EXE 构建、CLI 运行与 GUI 启动检查通过。',
+              '- 原生 x64 容器集成通过，包括出口核对、直连阻断、显示鉴权、localhost 回调、网关许可失效与数据保留。',
+              '- 尚未在真实 Windows 11 + Docker Desktop 桌面完成整套交互验收，也未使用真实账号执行登录或模型请求。',
+              '- 这是独立重建的预览实现；Chromium 使用容器隔离和 `--no-sandbox`。完整支持范围、数据存储和限制见使用说明。',
+              '',
+              '[使用说明](https://github.com/engeeeee/egress-workbench-app/blob/' + tag + '/windows/README.zh-CN.md) · [验证记录](https://github.com/engeeeee/egress-workbench-app/blob/' + tag + '/docs/windows-preview-validation.zh-CN.md) · [通过的构建](https://github.com/engeeeee/egress-workbench-app/actions/runs/42378568840)',
+              '',
+              'SHA-256：`' + expected + '`',
+            ].join('\n');
+            let existingTag;
+            try {
+              existingTag = (await github.rest.git.getRef({owner, repo, ref: 'tags/' + tag})).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            if (existingTag && existingTag.object.sha !== source) {
+              throw new Error('The version tag already points to a different commit; it was not changed.');
+            }
+            let release;
+            try {
+              release = (await github.rest.repos.getReleaseByTag({owner, repo, tag})).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            if (!release) {
+              release = (await github.rest.repos.createRelease({
+                owner, repo, tag_name: tag, target_commitish: source,
+                name: 'Egress Workbench Windows 0.1.0 Preview',
+                body, draft: true, prerelease: true,
+              })).data;
+            }
+            const assets = (await github.rest.repos.listReleaseAssets({owner, repo, release_id: release.id})).data;
+            const checksum = Buffer.from(expected + '  ' + filename + '\n', 'utf8');
+            for (const [name, data, type] of [
+              [filename, payload, 'application/zip'],
+              [filename + '.sha256', checksum, 'text/plain'],
+            ]) {
+              const previous = assets.find(asset => asset.name === name);
+              const digest = 'sha256:' + crypto.createHash('sha256').update(data).digest('hex');
+              if (previous) {
+                if (previous.size !== data.length || previous.digest !== digest) {
+                  throw new Error('An existing release asset differs; it was not overwritten: ' + name);
+                }
+                continue;
+              }
+              await github.rest.repos.uploadReleaseAsset({
+                owner, repo, release_id: release.id, name, data,
+                headers: {'content-type': type, 'content-length': data.length},
+              });
+            }
+            const published = (await github.rest.repos.updateRelease({
+              owner, repo, release_id: release.id,
+              name: 'Egress Workbench Windows 0.1.0 Preview', body,
+              draft: false, prerelease: true, make_latest: 'false',
+            })).data;
+            core.notice('Published ' + published.html_url);
