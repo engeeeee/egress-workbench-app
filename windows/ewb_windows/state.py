@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import uuid
+import time
 
 
 class WorkbenchError(RuntimeError):
@@ -62,7 +63,7 @@ class Store:
         atomic_json(self.home / name, value)
 
     def settings(self) -> dict:
-        return {"context": "desktop-linux", "timezone": "America/Los_Angeles", "selected": "", "projects": [], **self.read("settings.json", {})}
+        return {"context": "desktop-linux", "timezone": "America/Los_Angeles", "selected": "", "projects": [], "relay": {"enabled": False, "downloads": True}, **self.read("settings.json", {})}
 
     @contextmanager
     def lock(self, name="operation"):
@@ -101,3 +102,8 @@ class Store:
             raise WorkbenchError("此版本不支持路径中包含逗号或换行的项目。")
         identity = hashlib.sha256(os.path.normcase(str(directory)).encode()).hexdigest()[:16]
         return directory, identity
+
+
+def status_snapshot(store):
+    state = store.read("runtime.json", {"phase": "stopped"})
+    return {"phase": state["phase"], "reason": state.get("reason", ""), "evidence": state.get("evidence"), "checked": state.get("checked"), "confirmed": state.get("confirmed"), "guard_age": round(time.time() - state.get("heartbeat", time.time())), "timezone": store.settings()["timezone"]}

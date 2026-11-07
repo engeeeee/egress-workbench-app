@@ -29,9 +29,9 @@ def normalize(value: dict, label: str = "") -> dict:
         raise ValueError("节点必须为对象")
     raw = dict(value.get("outbound", value))
     kind = str(raw.get("type", "")).lower()
-    kind = "shadowsocks" if kind == "ss" else kind
-    if kind not in ("trojan", "vless", "vmess", "shadowsocks"):
-        raise ValueError("仅支持 Trojan、VLESS、VMess、Shadowsocks")
+    kind = {"ss": "shadowsocks", "socks5": "socks", "socks5h": "socks", "https": "http"}.get(kind, kind)
+    if kind not in ("trojan", "vless", "vmess", "shadowsocks", "socks", "http"):
+        raise ValueError("支持 SOCKS5、HTTP、HTTPS、Trojan、VLESS、VMess、Shadowsocks")
     if raw.get("transport") or raw.get("flow") or raw.get("plugin") or raw.get("multiplex"):
         raise ValueError("暂不支持 WS、gRPC、Reality、XTLS、插件或多路复用")
     if raw.get("network", "tcp") not in ("tcp", ""):
@@ -42,7 +42,21 @@ def normalize(value: dict, label: str = "") -> dict:
     port = int(raw.get("server_port", raw.get("port", 0)))
     if not 1 <= port <= 65535:
         raise ValueError("服务器端口无效")
-    outbound = {"type": kind, "tag": "selected", "server": server, "server_port": port, "network": "tcp"}
+    outbound = {"type": kind, "tag": "selected", "server": server, "server_port": port}
+    if kind != "http":
+        outbound["network"] = "tcp"
+    if kind in ("socks", "http"):
+        if kind == "socks":
+            if str(raw.get("version", "5")) != "5":
+                raise ValueError("仅支持 SOCKS5 代理")
+            outbound["version"] = "5"
+        username, password = raw.get("username", ""), raw.get("password", "")
+        if not isinstance(username, str) or not isinstance(password, str) or len(username) > 1024 or len(password) > 2048:
+            raise ValueError("代理认证信息无效")
+        if password and not username:
+            raise ValueError("填写代理密码时也需要用户名")
+        if username:
+            outbound.update({"username": username, "password": password})
     if kind in ("trojan", "shadowsocks"):
         password = raw.get("password")
         if not isinstance(password, str) or not password or len(password) > 2048:
@@ -61,7 +75,7 @@ def normalize(value: dict, label: str = "") -> dict:
         if raw.get("method") not in SS_METHODS:
             raise ValueError("仅支持 Shadowsocks AEAD / 2022 加密方式")
         outbound["method"] = raw["method"]
-    tls = raw.get("tls", {})
+    tls = raw.get("tls", {"enabled": True} if str(raw.get("type", "")).lower() == "https" else {})
     if isinstance(tls, bool):
         tls = {"enabled": tls}
     if not isinstance(tls, dict):
@@ -86,6 +100,19 @@ def normalize(value: dict, label: str = "") -> dict:
 
 def uri_node(uri: str) -> dict:
     scheme = uri.split(":", 1)[0].lower()
+    if scheme in ("socks5", "socks5h", "socks", "http", "https"):
+        parsed = urllib.parse.urlsplit(uri)
+        if not parsed.hostname or parsed.path not in ("", "/"):
+            raise ValueError("代理地址格式：协议://用户名:密码@服务器:端口")
+        query = urllib.parse.parse_qs(parsed.query)
+        if set(query) - {"sni"}:
+            raise ValueError("代理链接中包含暂不支持的参数")
+        value = {"type": "socks" if scheme.startswith("socks") else "http", "server": parsed.hostname,
+                 "server_port": parsed.port or (443 if scheme == "https" else 80 if scheme == "http" else 1080),
+                 "username": urllib.parse.unquote(parsed.username or ""), "password": urllib.parse.unquote(parsed.password or "")}
+        if scheme == "https":
+            value["tls"] = {"enabled": True, "server_name": query.get("sni", [parsed.hostname])[0]}
+        return normalize(value, urllib.parse.unquote(parsed.fragment))
     if scheme == "vmess":
         v = json.loads(unbase64(uri.split("://", 1)[1]))
         if v.get("tls", "") not in ("", "tls") or v.get("host") or v.get("path"):

@@ -153,7 +153,7 @@ def run(context, output):
             assert execute(engine, resumed["Id"], "from pathlib import Path; print(Path('/home/workspace/.ewb-test').read_text()+Path('/tmp/ewb-layer').read_text())") == "homelayer"
             assert execute(engine, engine.inspect("browser")["Id"], "from pathlib import Path; print(Path('/home/workspace/.ewb-browser-test').read_text())") == "browser"
             passed("project files, tool home, writable layer and browser home survive stop/recheck")
-            report = {"passed": records, "exit": evidence["ip"], "docker": engine.doctor(), "time": time.time()}
+            report = {"passed": records, "images": engine.image_ids(), "recipes": engine.recipes, "docker": engine.doctor(), "time": time.time()}
             output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         finally:
             try:

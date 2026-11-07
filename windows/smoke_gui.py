@@ -9,7 +9,7 @@ from ewb_windows.state import Store
 
 with tempfile.TemporaryDirectory() as directory:
     root = tk.Tk()
-    app = App(root, Store(Path(directory)))
+    app = App(root, Store(Path(directory)), auto_check=False)
     root.update()
     assert len(app.buttons) >= 12
     assert app.phase.get()
@@ -18,6 +18,10 @@ with tempfile.TemporaryDirectory() as directory:
     assert not app.settings_match()
     app.poll()
     assert app.confirm_button.instate(["disabled"])
+    for page in app.pages:
+        app.show_page(page)
+        root.update()
+    app.show_page("overview")
     root.after(500, root.destroy)
     root.mainloop()
     print("GUI smoke check passed")

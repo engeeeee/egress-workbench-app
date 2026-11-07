@@ -1,7 +1,7 @@
 @echo off
 setlocal
-if exist "%~dp0dist\ewb\ewb.exe" (
-  "%~dp0dist\ewb\ewb.exe" %*
+if exist "%~dp0dist\EgressWorkbench\ewb.exe" (
+  "%~dp0dist\EgressWorkbench\ewb.exe" %*
   exit /b %errorlevel%
 )
 if not exist "%~dp0.venv\Scripts\python.exe" (

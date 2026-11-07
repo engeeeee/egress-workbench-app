@@ -14,9 +14,11 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import zipfile
+import queue
+import threading
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .state import Store, WorkbenchError, fingerprint
+from .state import Store, WorkbenchError, fingerprint, status_snapshot
 
 OWNER = "io.egress-workbench.windows.instance"
 ROLE = "io.egress-workbench.windows.role"
@@ -27,6 +29,13 @@ HIDDEN = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
 class Docker:
+    @staticmethod
+    def desktop_app():
+        if os.name != "nt":
+            return None
+        roots = [Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Docker/Docker", Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/DockerDesktop"]
+        return next((root / "Docker Desktop.exe" for root in roots if (root / "Docker Desktop.exe").is_file()), None)
+
     def __init__(self, context: str):
         candidates = [shutil.which("docker")]
         if os.name == "nt":
@@ -44,11 +53,46 @@ class Docker:
     def environment():
         return {k: v for k, v in os.environ.items() if k not in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH")}
 
-    def run(self, *args, timeout=60, log: Path | None = None) -> str:
+    def run(self, *args, timeout=60, log: Path | None = None, on_line=None, cancel=None) -> str:
         try:
             if log:
                 with log.open("a", encoding="utf-8") as stream:
-                    result = subprocess.run(self.command(*args), stdout=stream, stderr=subprocess.STDOUT, timeout=timeout, env=self.environment(), creationflags=HIDDEN)
+                    process = subprocess.Popen(self.command(*args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=self.environment(), creationflags=HIDDEN)
+                    lines = queue.Queue()
+                    def read():
+                        for line in process.stdout:
+                            lines.put(line)
+                        lines.put(None)
+                    threading.Thread(target=read, daemon=True).start()
+                    deadline = time.monotonic() + timeout
+                    try:
+                        while True:
+                            if cancel and cancel.is_set():
+                                from .downloads import DownloadPaused
+                                raise DownloadPaused("操作已取消，已有下载和构建缓存会保留。")
+                            if time.monotonic() > deadline:
+                                raise subprocess.TimeoutExpired(self.command(*args), timeout)
+                            try:
+                                line = lines.get(timeout=.15)
+                            except queue.Empty:
+                                continue
+                            if line is None:
+                                break
+                            stream.write(line)
+                            stream.flush()
+                            if on_line:
+                                on_line(line.rstrip())
+                        code = process.wait(timeout=5)
+                    finally:
+                        if process.poll() is None:
+                            process.terminate()
+                            try:
+                                process.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.wait()
+                        process.stdout.close()
+                    result = subprocess.CompletedProcess(self.command(*args), code)
                 output, error = "", f"详细日志：{log}"
             else:
                 result = subprocess.run(self.command(*args), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=self.environment(), creationflags=HIDDEN)
@@ -79,7 +123,7 @@ class Engine:
         self.internal, self.external = self.prefix + "-internal", self.prefix + "-external"
         files = {p.relative_to(RESOURCES).as_posix(): p.read_text(encoding="utf-8") for p in sorted(RESOURCES.rglob("*")) if p.is_file() and "__pycache__" not in str(p)}
         self.recipe = fingerprint(files)[:12]
-        self.recipes = {role: fingerprint({name: files[name] for name in names})[:12] for role, names in {"gateway": ["Dockerfile.gateway", "gateway.py"], "work": ["Dockerfile.work", "probe.py", "open_browser.py"]}.items()}
+        self.recipes = {role: fingerprint({name: files[name] for name in names})[:12] for role, names in {"gateway": ["Dockerfile.gateway", "gateway.py", "tunnel.py"], "work": ["Dockerfile.work", "probe.py", "open_browser.py"]}.items()}
         self.recipes["browser"] = fingerprint({"work": self.recipes["work"], **{name: files[name] for name in ("Dockerfile.browser", "browser.py", "vnc_stdio.py", "chromium-policy.json")}})[:12]
         self.images = {role: "ewb-windows/" + role + ":" + self.recipes[role] for role in ("gateway", "work", "browser")}
 
@@ -108,7 +152,7 @@ class Engine:
             raise WorkbenchError("仅支持 x64 或 ARM64 的 Linux 容器引擎。")
         return {"docker": info.get("ServerVersion"), "architecture": arch, "context": self.docker.context, "data": str(self.store.home)}
 
-    def install(self):
+    def install(self, progress=None, cancel=None):
         with self.store.lock():
             self.doctor()
             self.networks()
@@ -119,17 +163,53 @@ class Engine:
                     self.log(role + " 镜像已就绪。")
                     continue
                 self.log("构建 " + role + " 镜像；首次安装需要下载工具和 Chromium…")
-                self.docker.run("build", "--network", "default", "--label", RECIPE + "=" + self.recipes[role], "--build-arg", "WORK_IMAGE=" + self.images["work"], "-f", str(RESOURCES / ("Dockerfile." + role)), "-t", self.images[role], str(RESOURCES), timeout=2400, log=build_log)
+                if progress:
+                    progress({"stage": "build", "role": role})
+                self.docker.run("build", "--network", "default", "--label", RECIPE + "=" + self.recipes[role], "--build-arg", "WORK_IMAGE=" + self.images["work"], "-f", str(RESOURCES / ("Dockerfile." + role)), "-t", self.images[role], str(RESOURCES), timeout=2400, log=build_log, on_line=self.log, cancel=cancel)
             self.store.write("images.json", {role: self.docker.inspect("image", name)["Id"] for role, name in self.images.items()})
             self.log("环境安装完成。请导入节点，再检查和确认连接。")
+
+    def install_prebuilt(self, progress=lambda data: None, cancel=None):
+        from .downloads import manifest, download, RELEASE
+        from .proxy import proxy_url
+        with self.store.lock():
+            info = self.doctor()
+            available = {}
+            for role, identifier in self.store.read("images.json", {}).items():
+                obj = self.docker.inspect("image", identifier)
+                if obj and (obj.get("Config", {}).get("Labels") or {}).get(RECIPE) == self.recipes.get(role):
+                    available[role] = obj["Id"]
+            if len(available) == 3:
+                progress({"stage": "done"})
+                return
+            if info["architecture"] not in ("x86_64", "amd64"):
+                raise WorkbenchError("预构建环境目前提供 x64 版本。ARM64 可选择从源码构建。")
+            progress({"stage": "manifest"})
+            relay = self.store.settings()["relay"]
+            via = proxy_url(relay) if relay.get("downloads") else None
+            meta = manifest("linux/amd64", self.recipes, via)
+            archive = download(RELEASE + meta["filename"], self.store.home / "cache" / meta["filename"], meta["sha256"], meta["bytes"], progress, cancel, via)
+            if cancel and cancel.is_set():
+                from .downloads import DownloadPaused
+                raise DownloadPaused("安装已暂停，环境包已保留。")
+            self._stop("运行环境正在更新，请在完成后重新核对连接。")
+            progress({"stage": "import"})
+            self.docker.run("load", "--input", str(archive), timeout=1200, log=self.store.home / "build.log", on_line=self.log, cancel=cancel)
+            for role, identifier in meta["images"].items():
+                obj = self.docker.inspect("image", identifier)
+                if not obj or (obj.get("Config", {}).get("Labels") or {}).get(RECIPE) != self.recipes[role]:
+                    raise WorkbenchError("导入的镜像与本版本不匹配，请重试。")
+            self.store.write("images.json", {**meta["images"], **available})
+            self.store.write("runtime-bundle.json", {"version": meta["version"], "sha256": meta["sha256"], "bytes": meta["bytes"]})
+            progress({"stage": "done"})
 
     def image_ids(self):
         expected = self.store.read("images.json", {})
         if set(expected) != set(self.images):
             raise WorkbenchError("请先安装运行环境。")
         for role, name in self.images.items():
-            obj = self.docker.inspect("image", name)
-            if not obj or obj["Id"] != expected[role]:
+            obj = self.docker.inspect("image", expected[role])
+            if not obj or (obj.get("Config", {}).get("Labels") or {}).get(RECIPE) != self.recipes[role]:
                 raise WorkbenchError("运行镜像缺失或版本发生变化，请重新安装运行环境并检查连接。")
         return expected
 
@@ -141,7 +221,7 @@ class Engine:
             settings["selected"] = nodes[0]["id"]
             self.store.write("settings.json", settings)
 
-    def save_settings(self, selected: str, timezone: str, context: str):
+    def save_settings(self, selected: str, timezone: str, context: str, relay=None):
         try:
             ZoneInfo(timezone)
         except (ZoneInfoNotFoundError, ValueError) as error:
@@ -150,14 +230,18 @@ class Engine:
             raise WorkbenchError("Docker 上下文名称无效。")
         with self.store.lock():
             old = self.store.settings()
+            from .proxy import validate_relay
+            relay = validate_relay(old["relay"] if relay is None else relay)
             if old.get("context") != context and self.store.read("images.json"):
                 raise WorkbenchError("已安装的环境不能切换 Docker 上下文。请使用新的专用数据目录。")
             established = self.store.read("environment.json")
             if established and established["timezone"] != timezone:
                 raise WorkbenchError("已有持久化环境的时区固定。改变时区请使用新的专用数据目录。")
-            if (old["selected"], old["timezone"], old["context"]) != (selected, timezone, context):
+            old_route = {k: v for k, v in old["relay"].items() if k != "downloads"}
+            new_route = {k: v for k, v in relay.items() if k != "downloads"}
+            if (old["selected"], old["timezone"], old["context"], old_route) != (selected, timezone, context, new_route):
                 self._stop("设置已更新，请重新检查连接。")
-            self.store.write("settings.json", {**old, "selected": selected, "timezone": timezone, "context": context})
+            self.store.write("settings.json", {**old, "selected": selected, "timezone": timezone, "context": context, "relay": relay})
 
     def node(self):
         selected = self.store.settings()["selected"]
@@ -175,7 +259,8 @@ class Engine:
 
     def policy(self):
         settings = self.store.settings()
-        return fingerprint({"node": self.node(), "timezone": settings["timezone"], "context": settings["context"], "recipe": self.recipe})
+        relay = {k: v for k, v in settings["relay"].items() if k != "downloads"}
+        return fingerprint({"node": self.node(), "timezone": settings["timezone"], "context": settings["context"], "relay": relay, "recipe": self.recipe})
 
     def networks(self):
         for name, internal in ((self.internal, True), (self.external, False)):
@@ -198,7 +283,12 @@ class Engine:
         obj = self.inspect(role, name)
         if obj:
             if obj["Image"] != image:
-                raise WorkbenchError("已有容器的镜像与本版本不同。请保留数据，使用新的专用数据目录。")
+                if role in ("gateway", "browser") and not obj["State"]["Running"]:
+                    self.docker.run("rm", obj["Id"])
+                    obj = None
+                else:
+                    raise WorkbenchError("已有容器的镜像与本版本不同。请保留数据，使用新的专用数据目录。")
+        if obj:
             if not obj["State"]["Running"]:
                 self.docker.run("start", name)
             return self.inspect(role, name)
@@ -210,6 +300,21 @@ class Engine:
         ids = self.image_ids()
         gateway_ip, session_ip = self.networks()
         outbound = dict(self.node()["outbound"])
+        from .proxy import loopback, validate_relay
+        relay = validate_relay(self.store.settings()["relay"])
+        forward_target = None
+        extra = []
+        if relay["enabled"]:
+            if loopback(outbound["server"]):
+                raise WorkbenchError("启用本机线路中转时，落地节点请填写远端地址；本机代理填写到前置中转。")
+            middle = dict(relay["outbound"])
+            forward_target = {"host": middle["server"], "port": middle["server_port"]}
+            middle.update({"tag": "host-line", "server": "127.0.0.1", "server_port": 2081})
+            extra.append(middle)
+            outbound["detour"] = "host-line"
+        elif loopback(outbound["server"]) and outbound["type"] in ("socks", "http"):
+            forward_target = {"host": outbound["server"], "port": outbound["server_port"]}
+            outbound.update({"server": "127.0.0.1", "server_port": 2081})
         try:
             answers = socket.getaddrinfo(outbound["server"], outbound["server_port"], socket.AF_INET, socket.SOCK_STREAM)
             outbound["server"] = answers[0][4][0]
@@ -217,7 +322,7 @@ class Engine:
             raise WorkbenchError("本机无法解析节点的 IPv4 地址。") from error
         directory = self.store.home / "gateway"
         directory.mkdir(exist_ok=True)
-        config = {"log": {"level": "warn"}, "inbounds": [{"type": "mixed", "tag": "clients", "listen": gateway_ip, "listen_port": 2080}], "outbounds": [outbound], "route": {"final": "selected"}}
+        config = {"log": {"level": "warn"}, "inbounds": [{"type": "mixed", "tag": "clients", "listen": gateway_ip, "listen_port": 2080}], "outbounds": [outbound, *extra], "route": {"final": "selected"}}
         from .state import atomic_json
         atomic_json(directory / "config.json", config)
         atomic_json(directory / "lease.json", {"expires": time.time() + 300})
@@ -226,7 +331,20 @@ class Engine:
             self.docker.run("network", "connect", "--gw-priority", "1", self.external, gateway["Id"])
         session = self.ensure_container("session", ids["work"], ["--network", self.internal, "--ip", session_ip, "--dns", "127.0.0.1", "--read-only", "--tmpfs", "/tmp", "--memory", "128m"], ["sleep", "infinity"])
         self.store.write("environment.json", {"timezone": self.store.settings()["timezone"]})
-        return {"gateway": gateway["Id"], "session": session["Id"], "proxy": f"http://{gateway_ip}:2080", "config_hash": fingerprint(config)}
+        return {"gateway": gateway["Id"], "session": session["Id"], "proxy": f"http://{gateway_ip}:2080", "config_hash": fingerprint(config), "forward_target": forward_target}
+
+    def ensure_forward(self, state):
+        if not state.get("forward_target"):
+            return
+        for attempt in range(40):
+            current = self.store.read("forward.json", {})
+            if current.get("gateway") == state["gateway"] and current.get("policy") == state["policy"] and time.time() - current.get("heartbeat", 0) < 5:
+                time.sleep(.2)
+                return
+            if attempt % 4 == 0:
+                self.background("forward")
+            time.sleep(.25)
+        raise WorkbenchError("无法连接本机线路代理。请先启动线路客户端并核对监听地址、端口和认证信息。")
 
     def probe(self, state):
         output = self.docker.run("run", "--rm", "--network", "container:" + state["session"], "--cap-drop", "ALL", "--security-opt", "no-new-privileges", self.image_ids()["work"], "python3", "/opt/ewb/probe.py", state["proxy"], timeout=80)
@@ -245,6 +363,9 @@ class Engine:
             self._stop("正在检查连接。")
             try:
                 state = self.setup()
+                state.update({"phase": "checking", "policy": self.policy()})
+                self.store.write("runtime.json", state)
+                self.ensure_forward(state)
                 self.log("通过所选节点核对两个出口来源，并检查容器直连是否被阻断…")
                 evidence = self.probe(state)
                 state.update({"phase": "review", "policy": self.policy(), "checked": time.time(), "evidence": evidence})
@@ -265,6 +386,10 @@ class Engine:
         config = self.store.read("gateway/config.json")
         if fingerprint(config) != state["config_hash"] or self.policy() != state["policy"]:
             raise WorkbenchError("节点或运行配置已改变，请重新检查。")
+        if state.get("forward_target"):
+            forward = self.store.read("forward.json", {})
+            if forward.get("gateway") != state["gateway"] or forward.get("policy") != state["policy"] or time.time() - forward.get("heartbeat", 0) > 12:
+                raise WorkbenchError("本机线路中转已断开，请重新检查连接。")
         for name in self.managed():
             obj = self.docker.inspect("container", name)
             self.owned(obj)
@@ -470,5 +595,4 @@ class Engine:
         self.browser()
 
     def status(self):
-        state = self.store.read("runtime.json", {"phase": "stopped"})
-        return {"phase": state["phase"], "reason": state.get("reason", ""), "evidence": state.get("evidence"), "checked": state.get("checked"), "confirmed": state.get("confirmed"), "guard_age": round(time.time() - state.get("heartbeat", time.time())), "timezone": self.store.settings()["timezone"]}
+        return status_snapshot(self.store)

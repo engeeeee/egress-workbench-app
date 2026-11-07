@@ -3,8 +3,8 @@ name: Windows preview
 on:
   workflow_dispatch:
   push:
-    branches: [windows-preview]
-    paths: ['windows/**', 'tests/**', '.github/workflows/windows-preview.yml']
+    branches: [windows-preview, windows-ux]
+    paths: ['windows/**', 'tests/**', 'tools/**', '.github/workflows/windows-preview.yml']
   pull_request:
     paths: ['windows/**', 'tests/**', '.github/workflows/windows-preview.yml']
 
@@ -39,27 +39,50 @@ jobs:
           architecture: x64
       - name: Build Windows executables
         shell: pwsh
-        run: ./windows/Build-Windows.ps1
+        run: |
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed.' }
+          ./windows/Build-Windows.ps1
       - name: Verify packaged CLI
         shell: pwsh
         run: |
-          & ./windows/dist/ewb/ewb.exe --version
+          & ./windows/dist/EgressWorkbench/ewb.exe --version
           if ($LASTEXITCODE -ne 0) { throw 'Packaged CLI check failed.' }
+          & ./windows/dist/EgressWorkbench/ewb.exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged proxy transports/resources failed.' }
           $smokeHome = Join-Path $env:RUNNER_TEMP 'ewb-packaged-smoke'
-          & ./windows/dist/ewb/ewb.exe --data $smokeHome relay
+          & ./windows/dist/EgressWorkbench/ewb.exe --data $smokeHome relay
           if ($LASTEXITCODE -ne 0) { throw 'Packaged relay import check failed.' }
-          $gui = Start-Process -FilePath ./windows/dist/EgressWorkbench/EgressWorkbench.exe -ArgumentList '--data', $smokeHome -PassThru
-          Start-Sleep -Seconds 5
-          if ($gui.HasExited) { throw 'Packaged GUI exited during startup.' }
-          Stop-Process -Id $gui.Id
+          & ./windows/dist/EgressWorkbench/ewb.exe --data $smokeHome forward
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged forwarding imports failed.' }
+          $gui = Start-Process -FilePath ./windows/dist/EgressWorkbench/EgressWorkbench.exe -ArgumentList '--data', $smokeHome, '--smoke-gui' -PassThru
+          if (-not $gui.WaitForExit(20000) -or $gui.ExitCode -ne 0) { throw 'Packaged GUI startup failed.' }
+          $timing = Get-Content (Join-Path $smokeHome 'ui-smoke.json') | ConvertFrom-Json
+          Write-Output "First GUI paint: $($timing.first_paint_ms) ms"
+          if (-not $timing.icons) { throw 'Packaged application icons missing.' }
+      - name: Verify per-user setup and uninstall
+        shell: pwsh
+        run: |
+          $appDir = Join-Path $env:RUNNER_TEMP 'ewb-installed'
+          $setup = Start-Process -FilePath ./windows/dist/Egress-Workbench-Windows-x64-0.2.0-Setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/DIR=$appDir" -PassThru -Wait
+          if ($setup.ExitCode -ne 0 -or -not (Test-Path "$appDir/EgressWorkbench.exe")) { throw 'Setup failed.' }
+          & "$appDir/ewb.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'Installed CLI failed.' }
+          $uninstall = Start-Process -FilePath "$appDir/unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru -Wait
+          if ($uninstall.ExitCode -ne 0) { throw 'Uninstall failed.' }
       - uses: actions/upload-artifact@v4
         with:
-          name: Egress-Workbench-Windows-x64
-          path: windows/dist/Egress-Workbench-Windows-x64-0.1.0.zip
+          name: Egress-Workbench-Windows-x64-0.2.0
+          path: |
+            windows/dist/Egress-Workbench-Windows-x64-0.2.0-Portable.zip
+            windows/dist/Egress-Workbench-Windows-x64-0.2.0-Setup.exe
+            windows/dist/*.sha256
           if-no-files-found: error
   containers:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -70,3 +93,18 @@ jobs:
         env:
           PYTHONPATH: windows
         run: python -u tests/integration_runtime.py --context default --output "$RUNNER_TEMP/integration-results.json"
+      - name: Verify local line and landing chain
+        env:
+          PYTHONPATH: windows
+        run: python -u tests/integration_chain.py --context default
+      - name: Export the verified native environment
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/windows-ux'
+        env:
+          PYTHONPATH: windows
+        run: python tools/export_runtime.py --context default --report "$RUNNER_TEMP/integration-results.json" --output "$RUNNER_TEMP/runtime-package"
+      - name: Stage verified runtime files
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/windows-ux'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await require('./tools/upload_runtime.cjs')({github, context, core});

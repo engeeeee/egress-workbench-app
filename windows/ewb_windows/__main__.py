@@ -15,9 +15,13 @@ def main():
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--data", type=Path, help="专用数据目录，默认位于 LocalAppData")
     parser.add_argument("--project", default=str(Path.cwd()), help="项目目录")
+    parser.add_argument("--smoke-gui", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="action")
-    for action in ("gui", "doctor", "install", "check", "confirm", "browser", "stop", "status", "guard", "relay", "shell"):
+    for action in ("gui", "doctor", "check", "confirm", "browser", "stop", "status", "guard", "relay", "forward", "shell"):
         sub.add_parser(action)
+    installer = sub.add_parser("install")
+    installer.add_argument("--from-source", action="store_true", help="从源码构建，不下载预构建环境")
     importer = sub.add_parser("import-node")
     importer.add_argument("file", type=Path, help="本地订阅/节点文件（不保存订阅地址）")
     selector = sub.add_parser("select")
@@ -29,16 +33,32 @@ def main():
     if forwarded and args.action not in ("claude", "codex", "exec"):
         parser.error("unrecognized arguments: " + " ".join(forwarded))
     try:
+        if args.self_test:
+            from .downloads import client
+            from .forward import tunnel_type
+            from .platform_ui import ASSETS
+            for proxy in ("http://127.0.0.1:9", "socks5://127.0.0.1:9"):
+                with client(proxy):
+                    pass
+            assert tunnel_type() and (ASSETS / "app.ico").is_file()
+            print(json.dumps({"version": __version__, "resources": True, "proxy_transports": True}))
+            return 0
         store = Store(args.data)
         if args.action in (None, "gui"):
             from .gui import launch
-            launch(store)
+            launch(store, smoke=args.smoke_gui)
             return 0
         engine = Engine(store, lambda text: print(text, file=sys.stderr, flush=True))
         if args.action == "relay":
             from .relay import main as relay_main
             relay_main(store)
             return 0
+        elif args.action == "forward":
+            from .forward import main as forward_main
+            forward_main(store)
+            return 0
+        elif args.action == "install":
+            result = engine.install() if args.from_source else engine.install_prebuilt()
         elif args.action == "import-node":
             nodes, warnings = parse_nodes(args.file.read_text(encoding="utf-8-sig"))
             engine.save_nodes(nodes)
