@@ -89,7 +89,7 @@ class App:
                 self.button(row, name, lambda t=tool: self.open_terminal(t)).pack(side="left", padx=(0, 8))
         row = ttk.Frame(workspace)
         row.pack(fill="x", pady=(10, 0))
-        self.button(row, "打开共享 Chromium", lambda: self.run(lambda e: e.browser()), accent=True).pack(side="left")
+        self.button(row, "打开共享 Chromium", self.open_browser, accent=True).pack(side="left")
         ttk.Label(workspace, text="登录授权请在共享 Chromium 的远程画面内完成。\n关闭显示网页会保留浏览器；“停止整个环境”会停止工具和浏览器。", style="Subtitle.TLabel", wraplength=840).pack(anchor="w", pady=16)
         self.log_view = scrolledtext.ScrolledText(logs, font=("Consolas", 10), background="#111c2d", foreground="#dce7f5", relief="flat", state="disabled")
         self.log_view.pack(fill="both", expand=True)
@@ -161,6 +161,8 @@ class App:
         self.run(action)
 
     def confirm(self):
+        if not self.settings_match():
+            return
         if not messagebox.askyesno("核对连接", self.evidence.get() + "\n\n确认以上出口与配置时区后启用环境？", parent=self.root):
             return
         self.run(lambda e: e.confirm())
@@ -174,11 +176,24 @@ class App:
             self.project.set(path)
 
     def open_terminal(self, tool):
+        if not self.settings_match():
+            messagebox.showinfo("请先检查连接", "当前所选节点或时区尚未应用，请返回连接页重新检查。", parent=self.root)
+            return
         path = self.project.get().strip()
         if not path:
             messagebox.showinfo("选择项目", "请先选择一个具体项目文件夹。", parent=self.root)
             return
         self.run(lambda e: e.terminal(path, tool))
+
+    def settings_match(self):
+        saved = self.store.settings()
+        return (self.node_id(), self.timezone.get().strip(), self.context.get().strip()) == (saved["selected"], saved["timezone"], saved["context"])
+
+    def open_browser(self):
+        if not self.settings_match():
+            messagebox.showinfo("请先检查连接", "当前所选节点或时区尚未应用，请返回连接页重新检查。", parent=self.root)
+            return
+        self.run(lambda e: e.browser())
 
     def import_dialog(self):
         if Engine(self.store).status()["phase"] == "ready" and not messagebox.askyesno("导入节点", "导入节点会停止当前环境并要求重新核对。已保存的账号和项目数据会保留。继续？", parent=self.root):
@@ -252,9 +267,13 @@ class App:
                 self.evidence.set("出口 IP：—       地区：—\n配置时区：" + state["timezone"])
             if state["phase"] == "ready" and state["guard_age"] > 100:
                 self.phase.set("连接监测未响应，请重新检查")
+            matching = self.settings_match()
+            if not matching and state["phase"] in ("ready", "review"):
+                self.phase.set("设置已更改，请重新检查所选连接")
+                self.detail.set("上次测量结果对应已保存的设置；当前选择需要重新检查和确认。")
             for button in self.buttons:
                 button.configure(state="disabled" if self.busy else "normal")
-            self.confirm_button.configure(state="normal" if not self.busy and state["phase"] == "review" else "disabled")
+            self.confirm_button.configure(state="normal" if not self.busy and state["phase"] == "review" and matching else "disabled")
         except Exception:
             self.phase.set("状态读取失败")
         self.root.after(250, self.poll)

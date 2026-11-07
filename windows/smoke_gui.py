@@ -13,6 +13,11 @@ with tempfile.TemporaryDirectory() as directory:
     root.update()
     assert len(app.buttons) >= 12
     assert app.phase.get()
+    assert app.settings_match()
+    app.timezone.set("Etc/UTC")
+    assert not app.settings_match()
+    app.poll()
+    assert app.confirm_button.instate(["disabled"])
     root.after(500, root.destroy)
     root.mainloop()
     print("GUI smoke check passed")
